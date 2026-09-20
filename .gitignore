@@ -1,0 +1,7 @@
+/target/
+/models/
+/.cache/
+*.gguf
+*.part
+__pycache__/
+*.pyc

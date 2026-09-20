@@ -1,0 +1,36 @@
+name: Rust
+
+on: [push, pull_request, workflow_dispatch]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            host: x86_64-unknown-linux-gnu
+          - os: macos-15
+            host: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Confirm native architecture
+        env:
+          EXPECTED_HOST: ${{ matrix.host }}
+        run: |
+          python3 - <<'PY'
+          import os, subprocess
+          version = subprocess.check_output(["rustc", "-vV"], text=True)
+          assert "host: " + os.environ["EXPECTED_HOST"] in version, version
+          PY
+      - run: cargo fmt --check
+      - run: python3 scripts/check_rust_dependencies.py
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --locked --release

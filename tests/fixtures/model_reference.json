@@ -1,0 +1,97 @@
+{
+  "stq": {
+    "oracle_repo": "sjl623/llama.cpp",
+    "oracle_revision": "1e411d8f5a1e23525fa3265dfb4bd76265465397",
+    "model_sha256": "cc497fe8f033b52b3b8b00a7669e9661435432f9d4cd43f7ed24400c01507a93",
+    "tokenizer": "1.8b",
+    "prompt_tokens": [
+      120000,
+      120006,
+      26403,
+      252,
+      1873,
+      2602,
+      1079,
+      8251,
+      592,
+      16883,
+      11,
+      2385,
+      13,
+      120007
+    ],
+    "generated_tokens": [
+      17687,
+      270,
+      3042,
+      292,
+      120020
+    ],
+    "text": "你好，世界。",
+    "logits_file": "logits/stq.f32",
+    "relative_l2_limit": 0.03
+  },
+  "q2c": {
+    "oracle_repo": "chaxu01/llama.cpp",
+    "oracle_revision": "2af64dd00a6689a7bfaf69b4768a944d0ec6bade",
+    "model_sha256": "dcc33bbae9b28d923c8c76a64f6157840841d26f8774f3dfd770d5fabeeb1cd7",
+    "tokenizer": "1.8b",
+    "prompt_tokens": [
+      120000,
+      120006,
+      26403,
+      252,
+      1873,
+      2602,
+      1079,
+      8251,
+      592,
+      16883,
+      11,
+      2385,
+      13,
+      120007
+    ],
+    "generated_tokens": [
+      17687,
+      270,
+      3042,
+      292,
+      120020
+    ],
+    "text": "你好，世界。",
+    "logits_file": "logits/q2c.f32",
+    "relative_l2_limit": 0.03
+  },
+  "7b": {
+    "oracle_repo": "ggml-org/llama.cpp",
+    "oracle_revision": "b23efaa2ef147f547ee75cbf0c621d61904de80e",
+    "model_sha256": "9f96256500f3fc1ab4d64336b58f52a949a95ad7516b0c229476eef782f9f77b",
+    "tokenizer": "7b",
+    "prompt_tokens": [
+      127958,
+      28573,
+      279,
+      2768,
+      1495,
+      1139,
+      8620,
+      512,
+      9906,
+      11,
+      1917,
+      13,
+      127962
+    ],
+    "generated_tokens": [
+      109419,
+      3922,
+      100561,
+      1811,
+      127960
+    ],
+    "text": "你好，世界。",
+    "logits_file": "logits/7b.f32",
+    "relative_l2_limit": 0.03
+  }
+}

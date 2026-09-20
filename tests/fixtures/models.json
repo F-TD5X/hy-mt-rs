@@ -1,0 +1,26 @@
+{
+  "stq": {
+    "repo": "tencent/Hy-MT2-1.8B-1.25Bit-GGUF",
+    "revision": "9df5c824a00a744fb0512a29c640466f4d97dfb0",
+    "file": "Hy-MT2-1.8B-1.25Bit.gguf",
+    "sha256": "cc497fe8f033b52b3b8b00a7669e9661435432f9d4cd43f7ed24400c01507a93"
+  },
+  "q2c": {
+    "repo": "tencent/Hy-MT2-1.8B-2Bit-GGUF",
+    "revision": "b630487d19ab7f336664a15b07c638d0d1071471",
+    "file": "Hy-MT2-1.8B-2Bit.gguf",
+    "sha256": "dcc33bbae9b28d923c8c76a64f6157840841d26f8774f3dfd770d5fabeeb1cd7"
+  },
+  "7b": {
+    "repo": "tencent/Hy-MT2-7B-GGUF",
+    "revision": "ab8472660ac61fac25f1af43fac2599d52a8a775",
+    "file": "Hy-MT2-7B-Q4_K_M.gguf",
+    "sha256": "9f96256500f3fc1ab4d64336b58f52a949a95ad7516b0c229476eef782f9f77b"
+  },
+  "30b": {
+    "repo": "tencent/Hy-MT2-30B-A3B-GGUF",
+    "revision": "fd3dcbb6b31e9e03923ef4f9f42500f74c3851c3",
+    "file": "Hy-MT2-30B-A3B-Q4_K_M.gguf",
+    "sha256": "bb44b11bb0f7cd3d1321645b41e911cd3de2e473731227fc6bf37aa18b543f88"
+  }
+}

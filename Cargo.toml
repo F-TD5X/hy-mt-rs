@@ -1,0 +1,39 @@
+[package]
+name = "hy-mt-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Pure Rust CPU inference and Chat Completions for Hy-MT2 GGUF models"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+# The crates.io 0.11 release forces the C Oniguruma tokenizer backend.
+# This pinned upstream revision uses the Rust fancy-regex backend instead.
+candle-core = { git = "https://github.com/huggingface/candle", rev = "ddf1b879dc3a1760cbcb3f3c4a7c6467850cec4a", default-features = false }
+clap = { version = "4", features = ["derive"] }
+half = "2"
+libc = "0.2"
+memmap2 = "0.9"
+minijinja = { version = "2", features = ["json"] }
+rand = "0.9"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokenizers = { version = "=0.23.1", default-features = false, features = ["fancy-regex"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
