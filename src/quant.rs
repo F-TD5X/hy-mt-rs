@@ -120,6 +120,27 @@ impl Weight {
         Ok(out)
     }
 
+    pub fn row_into(&self, row: usize, out: &mut [f32]) -> Result<()> {
+        let n = self.shape()[0];
+        ensure!(
+            out.len() == n,
+            "{}: out buffer length mismatch",
+            self.name()
+        );
+        let row_bytes = n / self.dtype().block_len() * self.dtype().block_bytes();
+        ensure!(
+            row < self.info.byte_len / row_bytes,
+            "{}: row {row} out of range",
+            self.name()
+        );
+        decode(
+            self.dtype(),
+            &self.bytes()[row * row_bytes..(row + 1) * row_bytes],
+            out,
+        )?;
+        Ok(())
+    }
+
     pub fn expert(&self, index: usize) -> Result<Self> {
         ensure!(
             self.shape().len() == 3 && index < self.shape()[2],
@@ -148,7 +169,9 @@ impl Weight {
             let mut out = vec![0.; rows];
             let chunk_size = chunk_rows(rows);
             #[cfg(target_arch = "aarch64")]
-            if matches!(self.dtype(), DType::STQ1_0 | DType::Q6_K) && sdot_available() {
+            if matches!(self.dtype(), DType::STQ1_0 | DType::Q6_K | DType::Q2_0C)
+                && sdot_available()
+            {
                 self.gemv_q8(input, &mut out, chunk_size);
                 return Ok(out);
             }
@@ -180,6 +203,21 @@ impl Weight {
                                 chunk.iter_mut().zip(chunk_bytes.chunks_exact(row_bytes))
                             {
                                 *val = q6_row_dot(row_b, input);
+                            }
+                        });
+                }
+                DType::Q2_0C => {
+                    let all_bytes = self.bytes();
+                    out.par_chunks_mut(chunk_size)
+                        .enumerate()
+                        .for_each(|(chunk_idx, chunk)| {
+                            let base_row = chunk_idx * chunk_size;
+                            let chunk_bytes = &all_bytes
+                                [base_row * row_bytes..(base_row + chunk.len()) * row_bytes];
+                            for (val, row_b) in
+                                chunk.iter_mut().zip(chunk_bytes.chunks_exact(row_bytes))
+                            {
+                                *val = q2c_row_dot(row_b, input);
                             }
                         });
                 }
@@ -284,9 +322,26 @@ impl Weight {
     /// Batch-1 GEMV through int8 activations and SDOT kernels.
     #[cfg(target_arch = "aarch64")]
     fn gemv_q8(&self, input: &[f32], out: &mut [f32], chunk_size: usize) {
+        let q8 = Q8::quantize(input);
+        self.gemv_q8_with_chunk(q8.values(), q8.scales(), out, chunk_size);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn gemv_q8_fast(&self, q8: &Q8, out: &mut [f32]) {
+        let chunk_size = chunk_rows(self.shape()[1]);
+        self.gemv_q8_with_chunk(q8.values(), q8.scales(), out, chunk_size);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn gemv_q8_with_chunk(
+        &self,
+        q8_values: &[i8],
+        q8_scales: &[f32],
+        out: &mut [f32],
+        chunk_size: usize,
+    ) {
         let cols = self.shape()[0];
         let row_bytes = cols / self.dtype().block_len() * self.dtype().block_bytes();
-        let q8 = Q8::quantize(input);
         let dtype = self.dtype();
         let all_bytes = self.bytes();
         out.par_chunks_mut(chunk_size)
@@ -298,7 +353,82 @@ impl Weight {
                 for (val, row) in chunk.iter_mut().zip(chunk_bytes.chunks_exact(row_bytes)) {
                     // SAFETY: each row is a whole number of 256-weight blocks,
                     // and `q8` holds one scale and 256 activations per block.
-                    *val = unsafe { row_dot_q8(dtype, row, &q8) };
+                    *val = unsafe { row_dot_q8_raw(dtype, row, q8_values, q8_scales) };
+                }
+            });
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn gemv_qkv_fast(
+        q: &Weight,
+        k: &Weight,
+        v: &Weight,
+        q8: &Q8,
+        q_out: &mut [f32],
+        k_out: &mut [f32],
+        v_out: &mut [f32],
+    ) -> Result<()> {
+        let cols = q.shape()[0];
+        let weights = [q, k, v];
+        let outputs = [q_out, k_out, v_out];
+        let mut tasks: Vec<(DType, &[u8], &mut [f32])> = Vec::with_capacity(128);
+        for (weight, output) in weights.into_iter().zip(outputs) {
+            let dtype = weight.dtype();
+            let row_bytes = cols / dtype.block_len() * dtype.block_bytes();
+            let bytes = weight.bytes();
+            let chunk_size = chunk_rows(output.len());
+            for (chunk_index, chunk) in output.chunks_mut(chunk_size).enumerate() {
+                let start = chunk_index * chunk_size;
+                tasks.push((
+                    dtype,
+                    &bytes[start * row_bytes..(start + chunk.len()) * row_bytes],
+                    chunk,
+                ));
+            }
+        }
+        let q8_vals = q8.values();
+        let q8_scs = q8.scales();
+        tasks.par_iter_mut().for_each(|(dtype, bytes, output)| {
+            let row_bytes = cols / dtype.block_len() * dtype.block_bytes();
+            for (value, row) in output.iter_mut().zip(bytes.chunks_exact(row_bytes)) {
+                // SAFETY: whole rows against whole activation groups.
+                *value = unsafe { row_dot_q8_raw(*dtype, row, q8_vals, q8_scs) };
+            }
+        });
+        Ok(())
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn matmul_gate_up_silu_fast(&self, up: &Weight, q8: &Q8, out: &mut [f32]) {
+        let (cols, rows) = (self.shape()[0], self.shape()[1]);
+        let row_bytes = cols / self.dtype().block_len() * self.dtype().block_bytes();
+        let chunk_size = chunk_rows(rows);
+        let dtype = self.dtype();
+        let self_bytes = self.bytes();
+        let up_bytes = up.bytes();
+        let q8_vals = q8.values();
+        let q8_scs = q8.scales();
+        out.par_chunks_mut(chunk_size)
+            .enumerate()
+            .for_each(|(chunk_idx, chunk)| {
+                let base_row = chunk_idx * chunk_size;
+                let self_chunk =
+                    &self_bytes[base_row * row_bytes..(base_row + chunk.len()) * row_bytes];
+                let up_chunk =
+                    &up_bytes[base_row * row_bytes..(base_row + chunk.len()) * row_bytes];
+                for ((val, g_b), u_b) in chunk
+                    .iter_mut()
+                    .zip(self_chunk.chunks_exact(row_bytes))
+                    .zip(up_chunk.chunks_exact(row_bytes))
+                {
+                    let (g, u) = unsafe {
+                        (
+                            row_dot_q8_raw(dtype, g_b, q8_vals, q8_scs),
+                            row_dot_q8_raw(dtype, u_b, q8_vals, q8_scs),
+                        )
+                    };
+                    let silu = g / (1.0 + (-g).exp());
+                    *val = silu * u;
                 }
             });
     }
@@ -327,7 +457,7 @@ impl Weight {
         if sdot_available()
             && [q, k, v]
                 .iter()
-                .all(|weight| matches!(weight.dtype(), DType::STQ1_0 | DType::Q6_K))
+                .all(|weight| matches!(weight.dtype(), DType::STQ1_0 | DType::Q6_K | DType::Q2_0C))
         {
             let q8 = Q8::quantize(input);
             let weights = [q, k, v];
@@ -387,7 +517,7 @@ impl Weight {
 
         #[cfg(target_arch = "aarch64")]
         if sdot_available()
-            && matches!(self.dtype(), DType::STQ1_0 | DType::Q6_K)
+            && matches!(self.dtype(), DType::STQ1_0 | DType::Q6_K | DType::Q2_0C)
             && self.dtype() == up.dtype()
         {
             let q8 = Q8::quantize(input);
@@ -458,6 +588,29 @@ impl Weight {
                         }
                     });
             }
+            (DType::Q2_0C, DType::Q2_0C) => {
+                let self_bytes = self.bytes();
+                let up_bytes = up.bytes();
+                out.par_chunks_mut(chunk_size)
+                    .enumerate()
+                    .for_each(|(chunk_idx, chunk)| {
+                        let base_row = chunk_idx * chunk_size;
+                        let self_chunk =
+                            &self_bytes[base_row * row_bytes..(base_row + chunk.len()) * row_bytes];
+                        let up_chunk =
+                            &up_bytes[base_row * row_bytes..(base_row + chunk.len()) * row_bytes];
+                        for ((val, g_b), u_b) in chunk
+                            .iter_mut()
+                            .zip(self_chunk.chunks_exact(row_bytes))
+                            .zip(up_chunk.chunks_exact(row_bytes))
+                        {
+                            let g = q2c_row_dot(g_b, input);
+                            let u = q2c_row_dot(u_b, input);
+                            let silu = g / (1.0 + (-g).exp());
+                            *val = silu * u;
+                        }
+                    });
+            }
             _ => {
                 let mut gate = self.matmul(input, 1)?;
                 let up_out = up.matmul(input, 1)?;
@@ -488,35 +641,77 @@ const Q8_GROUP: usize = 256;
 /// NEON FMA per four products. The scale layout follows the packed weight
 /// blocks, so a block's contribution is `weight_scale * group_scale * dot`.
 #[cfg(target_arch = "aarch64")]
-struct Q8 {
+pub(crate) struct Q8 {
     values: Vec<i8>,
     scales: Vec<f32>,
 }
 
 #[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn max_abs_neon(source: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+    unsafe {
+        let mut m0 = vdupq_n_f32(0.);
+        let mut m1 = vdupq_n_f32(0.);
+        let mut m2 = vdupq_n_f32(0.);
+        let mut m3 = vdupq_n_f32(0.);
+        let chunks = source.len() / 16;
+        let mut ptr = source.as_ptr();
+        for _ in 0..chunks {
+            m0 = vmaxq_f32(m0, vabsq_f32(vld1q_f32(ptr)));
+            m1 = vmaxq_f32(m1, vabsq_f32(vld1q_f32(ptr.add(4))));
+            m2 = vmaxq_f32(m2, vabsq_f32(vld1q_f32(ptr.add(8))));
+            m3 = vmaxq_f32(m3, vabsq_f32(vld1q_f32(ptr.add(12))));
+            ptr = ptr.add(16);
+        }
+        let m = vmaxq_f32(vmaxq_f32(m0, m1), vmaxq_f32(m2, m3));
+        let mut max = vmaxvq_f32(m);
+        for &val in &source[chunks * 16..] {
+            max = max.max(val.abs());
+        }
+        max
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
 impl Q8 {
-    fn quantize(input: &[f32]) -> Self {
-        let mut values = vec![0i8; input.len()];
-        let mut scales = Vec::with_capacity(input.len().div_ceil(Q8_GROUP));
-        for (source, target) in input.chunks(Q8_GROUP).zip(values.chunks_mut(Q8_GROUP)) {
-            let max = source.iter().fold(0f32, |acc, value| acc.max(value.abs()));
+    pub(crate) fn new(len: usize) -> Self {
+        Self {
+            values: vec![0i8; len],
+            scales: vec![0f32; len.div_ceil(Q8_GROUP)],
+        }
+    }
+
+    pub(crate) fn quantize_into(&mut self, input: &[f32]) {
+        assert_eq!(self.values.len(), input.len());
+        assert_eq!(self.scales.len(), input.len().div_ceil(Q8_GROUP));
+        for (source, (target, scale_out)) in input
+            .chunks(Q8_GROUP)
+            .zip(self.values.chunks_mut(Q8_GROUP).zip(self.scales.iter_mut()))
+        {
+            let max = unsafe { max_abs_neon(source) };
             let (scale, inverse) = if max > 0. {
                 (max / 127., 127. / max)
             } else {
                 (0., 0.)
             };
-            scales.push(scale);
+            *scale_out = scale;
             // SAFETY: both slices have the same length.
             unsafe { quantize_group_neon(source, inverse, target) };
         }
-        Self { values, scales }
     }
 
-    fn values(&self) -> &[i8] {
+    pub(crate) fn quantize(input: &[f32]) -> Self {
+        let mut q8 = Self::new(input.len());
+        q8.quantize_into(input);
+        q8
+    }
+
+    pub(crate) fn values(&self) -> &[i8] {
         &self.values
     }
 
-    fn scales(&self) -> &[f32] {
+    pub(crate) fn scales(&self) -> &[f32] {
         &self.scales
     }
 }
@@ -576,7 +771,7 @@ unsafe fn sdot(
 
 /// True when this CPU has ARMv8.2 integer dot products (`sdot`).
 #[cfg(target_arch = "aarch64")]
-fn sdot_available() -> bool {
+pub(crate) fn sdot_available() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
     static STATE: AtomicU8 = AtomicU8::new(0);
     match STATE.load(Ordering::Relaxed) {
@@ -1055,15 +1250,40 @@ unsafe fn stq_row_dot_sdot(row_bytes: &[u8], activations: &[i8], scales: &[f32])
 
         for (&scale, block) in scales.iter().zip(row_bytes.as_chunks::<42>().0) {
             let block_scale = half_raw(block.as_ptr().add(40)) * scale;
-            let mut acc = vdupq_n_s32(0);
-            for c in 0..4usize {
-                for (p, digits) in stq_digit_lanes(block.as_ptr(), c, &tables, sign_shifts)
-                    .iter()
-                    .enumerate()
-                {
-                    acc = sdot(acc, vld1q_s8(x_ptr.add(c * 64 + p * 16)), *digits);
-                }
-            }
+            let mut acc0 = vdupq_n_s32(0);
+            let mut acc1 = vdupq_n_s32(0);
+            let mut acc2 = vdupq_n_s32(0);
+            let mut acc3 = vdupq_n_s32(0);
+
+            let d0 = stq_digit_lanes(block.as_ptr(), 0, &tables, sign_shifts);
+            let xp0 = x_ptr;
+            acc0 = sdot(acc0, vld1q_s8(xp0), d0[0]);
+            acc0 = sdot(acc0, vld1q_s8(xp0.add(16)), d0[1]);
+            acc0 = sdot(acc0, vld1q_s8(xp0.add(32)), d0[2]);
+            acc0 = sdot(acc0, vld1q_s8(xp0.add(48)), d0[3]);
+
+            let d1 = stq_digit_lanes(block.as_ptr(), 1, &tables, sign_shifts);
+            let xp1 = x_ptr.add(64);
+            acc1 = sdot(acc1, vld1q_s8(xp1), d1[0]);
+            acc1 = sdot(acc1, vld1q_s8(xp1.add(16)), d1[1]);
+            acc1 = sdot(acc1, vld1q_s8(xp1.add(32)), d1[2]);
+            acc1 = sdot(acc1, vld1q_s8(xp1.add(48)), d1[3]);
+
+            let d2 = stq_digit_lanes(block.as_ptr(), 2, &tables, sign_shifts);
+            let xp2 = x_ptr.add(128);
+            acc2 = sdot(acc2, vld1q_s8(xp2), d2[0]);
+            acc2 = sdot(acc2, vld1q_s8(xp2.add(16)), d2[1]);
+            acc2 = sdot(acc2, vld1q_s8(xp2.add(32)), d2[2]);
+            acc2 = sdot(acc2, vld1q_s8(xp2.add(48)), d2[3]);
+
+            let d3 = stq_digit_lanes(block.as_ptr(), 3, &tables, sign_shifts);
+            let xp3 = x_ptr.add(192);
+            acc3 = sdot(acc3, vld1q_s8(xp3), d3[0]);
+            acc3 = sdot(acc3, vld1q_s8(xp3.add(16)), d3[1]);
+            acc3 = sdot(acc3, vld1q_s8(xp3.add(32)), d3[2]);
+            acc3 = sdot(acc3, vld1q_s8(xp3.add(48)), d3[3]);
+
+            let acc = vaddq_s32(vaddq_s32(acc0, acc1), vaddq_s32(acc2, acc3));
             row_acc = vfmaq_n_f32(row_acc, vcvtq_f32_s32(acc), block_scale);
             x_ptr = x_ptr.add(256);
         }
@@ -1326,19 +1546,233 @@ unsafe fn q6_row_dot_neon(row_bytes: &[u8], x: &[f32]) -> f32 {
     }
 }
 
+/// Unpack 16 bytes of Q2_0C weights (64 2-bit values) into 4 vectors of 16 int8s
+/// in contiguous order: `[w0..w15, w16..w31, w32..w47, w48..w63]`.
+/// Weights are mapped from `{0, 1, 2, 3}` to `{-3, -1, 1, 3}`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn q2c_unpack_64(raw: std::arch::aarch64::uint8x16_t) -> [std::arch::aarch64::int8x16_t; 4] {
+    use std::arch::aarch64::*;
+    unsafe {
+        let mask = vdupq_n_u8(3);
+        let p0 = vandq_u8(raw, mask);
+        let p1 = vandq_u8(vshrq_n_u8(raw, 2), mask);
+        let p2 = vandq_u8(vshrq_n_u8(raw, 4), mask);
+        let p3 = vshrq_n_u8(raw, 6);
+
+        let three = vdupq_n_s8(3);
+        let p0_val = vsubq_s8(vshlq_n_s8(vreinterpretq_s8_u8(p0), 1), three);
+        let p1_val = vsubq_s8(vshlq_n_s8(vreinterpretq_s8_u8(p1), 1), three);
+        let p2_val = vsubq_s8(vshlq_n_s8(vreinterpretq_s8_u8(p2), 1), three);
+        let p3_val = vsubq_s8(vshlq_n_s8(vreinterpretq_s8_u8(p3), 1), three);
+
+        let z01_lo = vzip1q_s8(p0_val, p1_val);
+        let z23_lo = vzip1q_s8(p2_val, p3_val);
+        let w0_15 = vreinterpretq_s8_s16(vzip1q_s16(
+            vreinterpretq_s16_s8(z01_lo),
+            vreinterpretq_s16_s8(z23_lo),
+        ));
+        let w16_31 = vreinterpretq_s8_s16(vzip2q_s16(
+            vreinterpretq_s16_s8(z01_lo),
+            vreinterpretq_s16_s8(z23_lo),
+        ));
+
+        let z01_hi = vzip2q_s8(p0_val, p1_val);
+        let z23_hi = vzip2q_s8(p2_val, p3_val);
+        let w32_47 = vreinterpretq_s8_s16(vzip1q_s16(
+            vreinterpretq_s16_s8(z01_hi),
+            vreinterpretq_s16_s8(z23_hi),
+        ));
+        let w48_63 = vreinterpretq_s8_s16(vzip2q_s16(
+            vreinterpretq_s16_s8(z01_hi),
+            vreinterpretq_s16_s8(z23_hi),
+        ));
+
+        [w0_15, w16_31, w32_47, w48_63]
+    }
+}
+
+/// ARMv8.2 SDOT row dot for Q2_0C. Each 512-weight block has two 256-weight
+/// activation groups.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,dotprod")]
+unsafe fn q2c_row_dot_sdot(row_bytes: &[u8], activations: &[i8], scales: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+    unsafe {
+        let mut row_acc = vdupq_n_f32(0.);
+        let mut b_ptr = row_bytes.as_ptr();
+        let mut x_ptr = activations.as_ptr();
+        let num_blocks = row_bytes.len() / 130;
+
+        for block_idx in 0..num_blocks {
+            let d = half_raw(b_ptr);
+            let payload = b_ptr.add(2);
+
+            // Group 0: first 256 weights (chunks 0..4)
+            let scale0 = d * scales[block_idx * 2];
+            let mut acc0 = vdupq_n_s32(0);
+            let mut acc1 = vdupq_n_s32(0);
+            let mut acc2 = vdupq_n_s32(0);
+            let mut acc3 = vdupq_n_s32(0);
+
+            for chunk in 0..4 {
+                let raw = vld1q_u8(payload.add(chunk * 16));
+                let [w0, w1, w2, w3] = q2c_unpack_64(raw);
+                let xp = x_ptr.add(chunk * 64);
+                acc0 = sdot(acc0, vld1q_s8(xp), w0);
+                acc1 = sdot(acc1, vld1q_s8(xp.add(16)), w1);
+                acc2 = sdot(acc2, vld1q_s8(xp.add(32)), w2);
+                acc3 = sdot(acc3, vld1q_s8(xp.add(48)), w3);
+            }
+            let grp0_sum = vaddq_s32(vaddq_s32(acc0, acc1), vaddq_s32(acc2, acc3));
+            row_acc = vfmaq_n_f32(row_acc, vcvtq_f32_s32(grp0_sum), scale0);
+
+            // Group 1: second 256 weights (chunks 4..8)
+            let scale1 = d * scales[block_idx * 2 + 1];
+            let mut acc4 = vdupq_n_s32(0);
+            let mut acc5 = vdupq_n_s32(0);
+            let mut acc6 = vdupq_n_s32(0);
+            let mut acc7 = vdupq_n_s32(0);
+
+            for chunk in 0..4 {
+                let raw = vld1q_u8(payload.add(64 + chunk * 16));
+                let [w0, w1, w2, w3] = q2c_unpack_64(raw);
+                let xp = x_ptr.add(256 + chunk * 64);
+                acc4 = sdot(acc4, vld1q_s8(xp), w0);
+                acc5 = sdot(acc5, vld1q_s8(xp.add(16)), w1);
+                acc6 = sdot(acc6, vld1q_s8(xp.add(32)), w2);
+                acc7 = sdot(acc7, vld1q_s8(xp.add(48)), w3);
+            }
+            let grp1_sum = vaddq_s32(vaddq_s32(acc4, acc5), vaddq_s32(acc6, acc7));
+            row_acc = vfmaq_n_f32(row_acc, vcvtq_f32_s32(grp1_sum), scale1);
+
+            b_ptr = b_ptr.add(130);
+            x_ptr = x_ptr.add(512);
+        }
+
+        vaddvq_f32(row_acc)
+    }
+}
+
+/// Fused NEON float row kernel for Q2_0C.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn q2c_row_dot_neon(row_bytes: &[u8], x: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+    unsafe {
+        let num_blocks = row_bytes.len() / 130;
+        let mut b_ptr = row_bytes.as_ptr();
+        let mut x_ptr = x.as_ptr();
+        let mut row_acc = vdupq_n_f32(0.);
+
+        for _ in 0..num_blocks {
+            let d = half_raw(b_ptr);
+            let payload = b_ptr.add(2);
+            let mut block_acc0 = vdupq_n_f32(0.);
+            let mut block_acc1 = vdupq_n_f32(0.);
+
+            for chunk in 0..8 {
+                let raw = vld1q_u8(payload.add(chunk * 16));
+                let [w0, w1, w2, w3] = q2c_unpack_64(raw);
+                let xs = x_ptr.add(chunk * 64);
+
+                for (w_idx, &w_vec) in [w0, w1, w2, w3].iter().enumerate() {
+                    let xp = xs.add(w_idx * 16);
+                    let lo8 = vmovl_s8(vget_low_s8(w_vec));
+                    let hi8 = vmovl_high_s8(w_vec);
+                    let f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8)));
+                    let f1 = vcvtq_f32_s32(vmovl_high_s16(lo8));
+                    let f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8)));
+                    let f3 = vcvtq_f32_s32(vmovl_high_s16(hi8));
+
+                    block_acc0 = vfmaq_f32(block_acc0, vld1q_f32(xp), f0);
+                    block_acc1 = vfmaq_f32(block_acc1, vld1q_f32(xp.add(4)), f1);
+                    block_acc0 = vfmaq_f32(block_acc0, vld1q_f32(xp.add(8)), f2);
+                    block_acc1 = vfmaq_f32(block_acc1, vld1q_f32(xp.add(12)), f3);
+                }
+            }
+
+            let block_sum = vaddq_f32(block_acc0, block_acc1);
+            row_acc = vfmaq_n_f32(row_acc, block_sum, d);
+
+            b_ptr = b_ptr.add(130);
+            x_ptr = x_ptr.add(512);
+        }
+
+        vaddvq_f32(row_acc)
+    }
+}
+
+#[inline(always)]
+pub(crate) fn q2c_row_dot(row_bytes: &[u8], x: &[f32]) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { q2c_row_dot_neon(row_bytes, x) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let mut sum = 0.0;
+        for (block, bytes) in row_bytes.chunks_exact(130).enumerate() {
+            let d = half(&bytes[..2]);
+            let xs = &x[block * 512..(block + 1) * 512];
+            for (i, &x_val) in xs.iter().enumerate() {
+                let w = (2 * ((bytes[2 + i / 4] >> (2 * (i % 4))) & 3) as i32 - 3) as f32;
+                sum += d * w * x_val;
+            }
+        }
+        sum
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn q2c_decode_block_neon(bytes: &[u8], out: &mut [f32]) {
+    use std::arch::aarch64::*;
+    unsafe {
+        let d = half_raw(bytes.as_ptr());
+        let d_vec = vdupq_n_f32(d);
+        let payload = bytes.as_ptr().add(2);
+        let o_ptr = out.as_mut_ptr();
+        for chunk in 0..8 {
+            let raw = vld1q_u8(payload.add(chunk * 16));
+            let [w0, w1, w2, w3] = q2c_unpack_64(raw);
+            for (w_idx, &w_vec) in [w0, w1, w2, w3].iter().enumerate() {
+                let dst = o_ptr.add(chunk * 64 + w_idx * 16);
+                let lo8 = vmovl_s8(vget_low_s8(w_vec));
+                let hi8 = vmovl_high_s8(w_vec);
+                let f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8)));
+                let f1 = vcvtq_f32_s32(vmovl_high_s16(lo8));
+                let f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8)));
+                let f3 = vcvtq_f32_s32(vmovl_high_s16(hi8));
+                vst1q_f32(dst, vmulq_f32(f0, d_vec));
+                vst1q_f32(dst.add(4), vmulq_f32(f1, d_vec));
+                vst1q_f32(dst.add(8), vmulq_f32(f2, d_vec));
+                vst1q_f32(dst.add(12), vmulq_f32(f3, d_vec));
+            }
+        }
+    }
+}
+
 /// One packed row of `dtype` against quantized activations.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn row_dot_q8(dtype: DType, row: &[u8], q8: &Q8) -> f32 {
+unsafe fn row_dot_q8_raw(dtype: DType, row: &[u8], q8_values: &[i8], q8_scales: &[f32]) -> f32 {
     // SAFETY: callers pass whole rows, so every row is a whole number of
     // 256-weight blocks, and `q8` holds one scale and 256 values per block.
     unsafe {
-        if dtype == DType::STQ1_0 {
-            stq_row_dot_sdot(row, q8.values(), q8.scales())
-        } else {
-            q6_row_dot_sdot(row, q8.values(), q8.scales())
+        match dtype {
+            DType::STQ1_0 => stq_row_dot_sdot(row, q8_values, q8_scales),
+            DType::Q6_K => q6_row_dot_sdot(row, q8_values, q8_scales),
+            DType::Q2_0C => q2c_row_dot_sdot(row, q8_values, q8_scales),
+            _ => unreachable!(),
         }
     }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn row_dot_q8(dtype: DType, row: &[u8], q8: &Q8) -> f32 {
+    unsafe { row_dot_q8_raw(dtype, row, q8.values(), q8.scales()) }
 }
 
 /// ARMv8.2 SDOT row dot for Q6_K. Integer dot products replace the per-lane
@@ -1353,7 +1787,8 @@ unsafe fn q6_row_dot_sdot(row_bytes: &[u8], activations: &[i8], scales: &[f32]) 
         let mask15 = vdupq_n_u8(15);
         let mask3 = vdupq_n_u8(3);
         let c32 = vdupq_n_s8(32);
-        let mut row_acc = vdupq_n_f32(0.);
+        let mut row_acc0 = vdupq_n_f32(0.);
+        let mut row_acc1 = vdupq_n_f32(0.);
         let mut x_ptr = activations.as_ptr();
 
         for (&scale, block) in scales.iter().zip(row_bytes.as_chunks::<210>().0) {
@@ -1363,31 +1798,44 @@ unsafe fn q6_row_dot_sdot(row_bytes: &[u8], activations: &[i8], scales: &[f32]) 
                 let qh = block.as_ptr().add(128 + c * 32);
                 let sc = block.as_ptr().add(192 + c * 8);
                 for p in 0..4usize {
-                    for h in 0..2usize {
-                        let qlv = vld1q_u8(ql.add((p & 1) * 32 + h * 16));
-                        let qhv = vld1q_u8(qh.add(h * 16));
-                        let lo6 = match p {
-                            2 | 3 => vandq_u8(vshrq_n_u8(qlv, 4), mask15),
-                            _ => vandq_u8(qlv, mask15),
-                        };
-                        let bits = match p {
-                            0 => qhv,
-                            1 => vshrq_n_u8(qhv, 2),
-                            2 => vshrq_n_u8(qhv, 4),
-                            _ => vshrq_n_u8(qhv, 6),
-                        };
-                        let q6 = vorrq_u8(lo6, vshlq_n_u8(vandq_u8(bits, mask3), 4));
-                        let digits = vsubq_s8(vreinterpretq_s8_u8(q6), c32);
-                        let base = x_ptr.add(c * 128 + p * 32 + h * 16);
-                        let acc = sdot(vdupq_n_s32(0), vld1q_s8(base), digits);
-                        let plane = d * (*sc.add(2 * p + h) as i8) as f32;
-                        row_acc = vfmaq_n_f32(row_acc, vcvtq_f32_s32(acc), plane);
-                    }
+                    let qlv0 = vld1q_u8(ql.add((p & 1) * 32));
+                    let qlv1 = vld1q_u8(ql.add((p & 1) * 32 + 16));
+                    let qhv0 = vld1q_u8(qh);
+                    let qhv1 = vld1q_u8(qh.add(16));
+
+                    let lo6_0 = match p {
+                        2 | 3 => vandq_u8(vshrq_n_u8(qlv0, 4), mask15),
+                        _ => vandq_u8(qlv0, mask15),
+                    };
+                    let lo6_1 = match p {
+                        2 | 3 => vandq_u8(vshrq_n_u8(qlv1, 4), mask15),
+                        _ => vandq_u8(qlv1, mask15),
+                    };
+                    let (bits0, bits1) = match p {
+                        0 => (qhv0, qhv1),
+                        1 => (vshrq_n_u8(qhv0, 2), vshrq_n_u8(qhv1, 2)),
+                        2 => (vshrq_n_u8(qhv0, 4), vshrq_n_u8(qhv1, 4)),
+                        _ => (vshrq_n_u8(qhv0, 6), vshrq_n_u8(qhv1, 6)),
+                    };
+                    let q6_0 = vorrq_u8(lo6_0, vshlq_n_u8(vandq_u8(bits0, mask3), 4));
+                    let q6_1 = vorrq_u8(lo6_1, vshlq_n_u8(vandq_u8(bits1, mask3), 4));
+                    let digits0 = vsubq_s8(vreinterpretq_s8_u8(q6_0), c32);
+                    let digits1 = vsubq_s8(vreinterpretq_s8_u8(q6_1), c32);
+
+                    let base0 = x_ptr.add(c * 128 + p * 32);
+                    let base1 = base0.add(16);
+                    let acc0 = sdot(vdupq_n_s32(0), vld1q_s8(base0), digits0);
+                    let acc1 = sdot(vdupq_n_s32(0), vld1q_s8(base1), digits1);
+
+                    let plane0 = d * (*sc.add(2 * p) as i8) as f32;
+                    let plane1 = d * (*sc.add(2 * p + 1) as i8) as f32;
+                    row_acc0 = vfmaq_n_f32(row_acc0, vcvtq_f32_s32(acc0), plane0);
+                    row_acc1 = vfmaq_n_f32(row_acc1, vcvtq_f32_s32(acc1), plane1);
                 }
             }
             x_ptr = x_ptr.add(256);
         }
-        vaddvq_f32(row_acc)
+        vaddvq_f32(vaddq_f32(row_acc0, row_acc1))
     }
 }
 
@@ -1474,9 +1922,17 @@ fn decode_unchecked(dtype: DType, bytes: &[u8], out: &mut [f32]) {
                 }
             }
             DType::Q2_0C => {
-                let d = half(x);
-                for (i, out) in y.iter_mut().enumerate() {
-                    *out = (2 * ((x[2 + i / 4] >> (2 * (i % 4))) & 3) as i32 - 3) as f32 * d;
+                #[cfg(target_arch = "aarch64")]
+                {
+                    // SAFETY: x has 130 bytes and y has 512 elements.
+                    unsafe { q2c_decode_block_neon(x, y) };
+                }
+                #[cfg(not(target_arch = "aarch64"))]
+                {
+                    let d = half(x);
+                    for (i, out) in y.iter_mut().enumerate() {
+                        *out = (2 * ((x[2 + i / 4] >> (2 * (i % 4))) & 3) as i32 - 3) as f32 * d;
+                    }
                 }
             }
             DType::STQ1_0 => {
@@ -1738,6 +2194,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fused_q2c_dot_matches_decode() {
+        for seed in 0..64u32 {
+            let mut block = [0u8; 130];
+            for (i, slot) in block.iter_mut().enumerate().skip(2) {
+                *slot = (seed.wrapping_mul(40503).wrapping_add(i as u32 * 13)) as u8;
+            }
+            block[..2].copy_from_slice(&f16::from_f32(0.25 + seed as f32 % 0.75).to_le_bytes());
+            let x: Vec<_> = (0..512)
+                .map(|i| ((i as f32 + seed as f32) * 0.17).sin())
+                .collect();
+            let mut decoded = [0f32; 512];
+            decode_unchecked(DType::Q2_0C, &block, &mut decoded);
+            let expected = dot(&decoded, &x);
+            assert!(
+                (q2c_row_dot(&block, &x) - expected).abs() < 1e-3,
+                "seed {seed}"
+            );
+        }
+    }
+
     /// Kernel-level throughput probe for the batch-1 GEMV path. Needs a local
     /// 1.25Bit GGUF:
     /// `cargo test --release --lib -- --ignored --nocapture kernel_throughput`.
@@ -1785,13 +2262,14 @@ mod tests {
         for (name, label) in shapes {
             let weight = gguf.tensor(name)?;
             let (rows, cols) = (weight.shape()[1], weight.shape()[0]);
-            let row_bytes = cols / 256 * weight.dtype().block_bytes();
+            let row_bytes = cols / weight.dtype().block_len() * weight.dtype().block_bytes();
             let bytes = weight.bytes();
             let x: Vec<f32> = (0..cols).map(|i| ((i as f32) * 0.017).sin()).collect();
-            let fallback: fn(&[u8], &[f32]) -> f32 = if weight.dtype() == DType::STQ1_0 {
-                stq_row_dot
-            } else {
-                q6_row_dot
+            let fallback: fn(&[u8], &[f32]) -> f32 = match weight.dtype() {
+                DType::STQ1_0 => stq_row_dot,
+                DType::Q6_K => q6_row_dot,
+                DType::Q2_0C => q2c_row_dot,
+                _ => unreachable!(),
             };
             let secs = time(Box::new(|| {
                 let mut acc = 0f32;
@@ -1878,7 +2356,7 @@ mod tests {
             .map(|name| gguf.tensor(name))
             .collect::<Result<Vec<_>>>()?
             .into_iter()
-            .filter(|weight| weight.dtype() == DType::STQ1_0)
+            .filter(|weight| matches!(weight.dtype(), DType::STQ1_0 | DType::Q2_0C))
             .collect();
         decoder.sort_by_key(|weight| weight.name().to_string());
         let decoder_bytes: usize = decoder.iter().map(|weight| weight.bytes().len()).sum();
@@ -1932,7 +2410,7 @@ mod tests {
                     .flat_map(|weight| {
                         let cols = weight.shape()[0];
                         let dtype = weight.dtype();
-                        let row_bytes = cols / 256 * dtype.block_bytes();
+                        let row_bytes = cols / dtype.block_len() * dtype.block_bytes();
                         weight
                             .bytes()
                             .chunks_exact(row_bytes)
@@ -2072,6 +2550,32 @@ mod tests {
                 .sum();
             // SAFETY: the row is two whole 210-byte blocks and `q8` covers them.
             let got = unsafe { q6_row_dot_sdot(&q6, q8.values(), q8.scales()) };
+            assert!(
+                (got as f64 - expected).abs() <= magnitude * 1e-5,
+                "seed {seed}: sdot {got} vs reference {expected}"
+            );
+
+            let mut q2c = vec![0u8; 130];
+            for (i, slot) in q2c.iter_mut().enumerate().skip(2) {
+                *slot = (seed.wrapping_mul(40503).wrapping_add(i as u32 * 13)) as u8;
+            }
+            q2c[..2].copy_from_slice(&f16::from_f32(0.375).to_le_bytes());
+            let mut q2c_weights = vec![0.; 512];
+            decode(DType::Q2_0C, &q2c, &mut q2c_weights).unwrap();
+            let expected: f64 = q2c_weights
+                .iter()
+                .enumerate()
+                .map(|(i, w)| *w as f64 * q8.values()[i] as f64 * q8.scales()[i / Q8_GROUP] as f64)
+                .sum();
+            let magnitude: f64 = q2c_weights
+                .iter()
+                .enumerate()
+                .map(|(i, w)| {
+                    (*w as f64 * q8.values()[i] as f64 * q8.scales()[i / Q8_GROUP] as f64).abs()
+                })
+                .sum();
+            // SAFETY: the row is one whole 130-byte block and `q8` covers it.
+            let got = unsafe { q2c_row_dot_sdot(&q2c, q8.values(), q8.scales()) };
             assert!(
                 (got as f64 - expected).abs() <= magnitude * 1e-5,
                 "seed {seed}: sdot {got} vs reference {expected}"

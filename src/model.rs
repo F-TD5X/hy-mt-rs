@@ -7,9 +7,11 @@ use rayon::prelude::*;
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(target_arch = "aarch64")]
+use crate::quant::sdot_available;
 use crate::{
     gguf::{Gguf, Profile},
-    quant::{Weight, dot},
+    quant::{DType, Weight, dot},
     tokenizer::ChatTokenizer,
 };
 
@@ -96,6 +98,19 @@ pub struct Session {
     context: usize,
     poisoned: bool,
     model_key: Arc<()>,
+    hidden: Vec<f32>,
+    normalized: Vec<f32>,
+    q: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    attended: Vec<f32>,
+    projected: Vec<f32>,
+    gate: Vec<f32>,
+    ff: Vec<f32>,
+    #[cfg(target_arch = "aarch64")]
+    q8_hidden: crate::quant::Q8,
+    #[cfg(target_arch = "aarch64")]
+    q8_ffn: crate::quant::Q8,
 }
 
 #[derive(Default)]
@@ -275,6 +290,13 @@ impl Model {
             "context must be between 1 and {}",
             self.config.context_length
         );
+        let h = self.config.hidden;
+        let q_len = self.config.heads * self.config.head_dim;
+        let kv_len = self.config.kv_heads * self.config.head_dim;
+        let ffn_len = match &self.layers[0].ffn {
+            Ffn::Dense(ff) => ff.gate.shape()[1],
+            Ffn::Moe(ff) => ff.shared.gate.shape()[1],
+        };
         Ok(Session {
             caches: (0..self.config.layers)
                 .map(|_| KvCache::default())
@@ -283,6 +305,19 @@ impl Model {
             context,
             poisoned: false,
             model_key: self.session_key.clone(),
+            hidden: vec![0.; h],
+            normalized: vec![0.; h],
+            q: vec![0.; q_len],
+            k: vec![0.; kv_len],
+            v: vec![0.; kv_len],
+            attended: vec![0.; q_len],
+            projected: vec![0.; h],
+            gate: vec![0.; ffn_len],
+            ff: vec![0.; h],
+            #[cfg(target_arch = "aarch64")]
+            q8_hidden: crate::quant::Q8::new(h),
+            #[cfg(target_arch = "aarch64")]
+            q8_ffn: crate::quant::Q8::new(ffn_len),
         })
     }
 
@@ -318,6 +353,178 @@ impl Model {
         check_cancel(cancel)?;
         session.poisoned = true;
         let batch = tokens.len();
+
+        if batch == 1 {
+            let id = tokens[0];
+            self.embedding.row_into(id as usize, &mut session.hidden)?;
+
+            let pos = session.position as f32;
+            let half_dim = self.config.head_dim / 2;
+            let mut cos_buf = [0f32; 64];
+            let mut sin_buf = [0f32; 64];
+            for (j, &freq) in self
+                .rope_frequencies
+                .iter()
+                .enumerate()
+                .take(half_dim.min(64))
+            {
+                let (s, c) = (pos * freq).sin_cos();
+                sin_buf[j] = s;
+                cos_buf[j] = c;
+            }
+            let (cos_s, sin_s) = (&cos_buf[..half_dim.min(64)], &sin_buf[..half_dim.min(64)]);
+
+            for (layer, cache) in self.layers.iter().zip(&mut session.caches) {
+                check_cancel(cancel)?;
+                rms_norm_into(
+                    &session.hidden,
+                    &layer.input_norm,
+                    self.config.rms_epsilon,
+                    &mut session.normalized,
+                );
+
+                #[cfg(target_arch = "aarch64")]
+                if sdot_available()
+                    && matches!(layer.q.dtype(), DType::STQ1_0 | DType::Q6_K | DType::Q2_0C)
+                {
+                    session.q8_hidden.quantize_into(&session.normalized);
+                    Weight::gemv_qkv_fast(
+                        &layer.q,
+                        &layer.k,
+                        &layer.v,
+                        &session.q8_hidden,
+                        &mut session.q,
+                        &mut session.k,
+                        &mut session.v,
+                    )?;
+                } else {
+                    let (q, k, v) =
+                        Weight::gemv_qkv(&layer.q, &layer.k, &layer.v, &session.normalized)?;
+                    session.q.copy_from_slice(&q);
+                    session.k.copy_from_slice(&k);
+                    session.v.copy_from_slice(&v);
+                }
+
+                if self.config.architecture == Architecture::HyV3 {
+                    rms_norm(&mut session.q, &layer.q_norm, self.config.rms_epsilon);
+                    rms_norm(&mut session.k, &layer.k_norm, self.config.rms_epsilon);
+                }
+                rope_with_cache(
+                    &mut session.q,
+                    self.config.heads,
+                    self.config.head_dim,
+                    cos_s,
+                    sin_s,
+                );
+                rope_with_cache(
+                    &mut session.k,
+                    self.config.kv_heads,
+                    self.config.head_dim,
+                    cos_s,
+                    sin_s,
+                );
+                if self.config.architecture == Architecture::Dense {
+                    rms_norm(&mut session.q, &layer.q_norm, self.config.rms_epsilon);
+                    rms_norm(&mut session.k, &layer.k_norm, self.config.rms_epsilon);
+                }
+                cache.append(
+                    &session.k,
+                    &session.v,
+                    self.config.kv_heads * self.config.head_dim,
+                    session.context,
+                )?;
+                attention_into(
+                    &session.q,
+                    cache,
+                    &self.config,
+                    session.position,
+                    &mut session.attended,
+                );
+
+                #[cfg(target_arch = "aarch64")]
+                if sdot_available()
+                    && matches!(
+                        layer.attn_output.dtype(),
+                        DType::STQ1_0 | DType::Q6_K | DType::Q2_0C
+                    )
+                {
+                    session.q8_hidden.quantize_into(&session.attended);
+                    layer
+                        .attn_output
+                        .gemv_q8_fast(&session.q8_hidden, &mut session.projected);
+                } else {
+                    let projected = layer.attn_output.matmul(&session.attended, 1)?;
+                    session.projected.copy_from_slice(&projected);
+                }
+                add(&mut session.hidden, &session.projected);
+
+                rms_norm_into(
+                    &session.hidden,
+                    &layer.ffn_norm,
+                    self.config.rms_epsilon,
+                    &mut session.normalized,
+                );
+
+                match &layer.ffn {
+                    Ffn::Dense(ff) => {
+                        #[cfg(target_arch = "aarch64")]
+                        if sdot_available()
+                            && matches!(ff.gate.dtype(), DType::STQ1_0 | DType::Q6_K | DType::Q2_0C)
+                            && ff.gate.dtype() == ff.up.dtype()
+                            && matches!(ff.down.dtype(), DType::STQ1_0 | DType::Q6_K | DType::Q2_0C)
+                        {
+                            session.q8_hidden.quantize_into(&session.normalized);
+                            ff.gate.matmul_gate_up_silu_fast(
+                                &ff.up,
+                                &session.q8_hidden,
+                                &mut session.gate,
+                            );
+                            session.q8_ffn.quantize_into(&session.gate);
+                            ff.down.gemv_q8_fast(&session.q8_ffn, &mut session.ff);
+                        } else {
+                            let ff_out = ff.forward(&session.normalized, 1)?;
+                            session.ff.copy_from_slice(&ff_out);
+                        }
+                    }
+                    Ffn::Moe(ff) => {
+                        let ff_out = ff.forward(&session.normalized, 1, cancel)?;
+                        session.ff.copy_from_slice(&ff_out);
+                    }
+                }
+                add(&mut session.hidden, &session.ff);
+            }
+
+            check_cancel(cancel)?;
+            rms_norm(
+                &mut session.hidden,
+                &self.output_norm,
+                self.config.rms_epsilon,
+            );
+            #[cfg(target_arch = "aarch64")]
+            let logits = if sdot_available()
+                && matches!(
+                    self.output.dtype(),
+                    DType::STQ1_0 | DType::Q6_K | DType::Q2_0C
+                ) {
+                session.q8_hidden.quantize_into(&session.hidden);
+                let mut logits = vec![0.; self.output.shape()[1]];
+                self.output.gemv_q8_fast(&session.q8_hidden, &mut logits);
+                logits
+            } else {
+                self.output.matmul(&session.hidden, 1)?
+            };
+            #[cfg(not(target_arch = "aarch64"))]
+            let logits = self.output.matmul(&session.hidden, 1)?;
+
+            ensure!(
+                logits.iter().all(|x| x.is_finite()),
+                "model produced non-finite logits; check model format and weights"
+            );
+            session.position += 1;
+            session.poisoned = false;
+            return Ok(logits);
+        }
+
         let mut hidden = Vec::with_capacity(batch * self.config.hidden);
         for &id in tokens {
             hidden.extend(self.embedding.row(id as usize)?);
@@ -542,6 +749,53 @@ fn norm(g: &Gguf, name: &str, len: usize) -> Result<Vec<f32>> {
     Ok(values)
 }
 
+fn rms_norm_into(input: &[f32], weights: &[f32], epsilon: f32, out: &mut [f32]) {
+    assert_eq!(input.len(), weights.len());
+    assert_eq!(out.len(), weights.len());
+    let w_len = weights.len();
+    let variance = dot(input, input) / w_len as f32;
+    let scale = (variance + epsilon).sqrt().recip();
+    #[cfg(target_arch = "aarch64")]
+    {
+        use std::arch::aarch64::*;
+        let scale_vec = unsafe { vdupq_n_f32(scale) };
+        let chunks = w_len / 16;
+        let mut ip = input.as_ptr();
+        let mut wp = weights.as_ptr();
+        let mut op = out.as_mut_ptr();
+        unsafe {
+            for _ in 0..chunks {
+                let i0 = vld1q_f32(ip);
+                let i1 = vld1q_f32(ip.add(4));
+                let i2 = vld1q_f32(ip.add(8));
+                let i3 = vld1q_f32(ip.add(12));
+                let w0 = vld1q_f32(wp);
+                let w1 = vld1q_f32(wp.add(4));
+                let w2 = vld1q_f32(wp.add(8));
+                let w3 = vld1q_f32(wp.add(12));
+                vst1q_f32(op, vmulq_f32(i0, vmulq_f32(w0, scale_vec)));
+                vst1q_f32(op.add(4), vmulq_f32(i1, vmulq_f32(w1, scale_vec)));
+                vst1q_f32(op.add(8), vmulq_f32(i2, vmulq_f32(w2, scale_vec)));
+                vst1q_f32(op.add(12), vmulq_f32(i3, vmulq_f32(w3, scale_vec)));
+                ip = ip.add(16);
+                wp = wp.add(16);
+                op = op.add(16);
+            }
+        }
+        for ((x, &weight), out_val) in input[chunks * 16..]
+            .iter()
+            .zip(&weights[chunks * 16..])
+            .zip(&mut out[chunks * 16..])
+        {
+            *out_val = *x * scale * weight;
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    for ((x, &weight), out_val) in input.iter().zip(weights).zip(out.iter_mut()) {
+        *out_val = *x * scale * weight;
+    }
+}
+
 fn rms_norm(values: &mut [f32], weights: &[f32], epsilon: f32) {
     let w_len = weights.len();
     for row in values.chunks_exact_mut(w_len) {
@@ -584,6 +838,51 @@ fn rms_norm(values: &mut [f32], weights: &[f32], epsilon: f32) {
     }
 }
 
+fn rope_with_cache(values: &mut [f32], _heads: usize, dim: usize, cos_s: &[f32], sin_s: &[f32]) {
+    let half_dim = dim / 2;
+    for head in values.chunks_exact_mut(dim) {
+        #[cfg(target_arch = "aarch64")]
+        {
+            use std::arch::aarch64::*;
+            let chunks = half_dim / 4;
+            let mut ap = head.as_mut_ptr();
+            let mut bp = unsafe { ap.add(half_dim) };
+            let mut cp = cos_s.as_ptr();
+            let mut sp = sin_s.as_ptr();
+            unsafe {
+                for _ in 0..chunks {
+                    let a = vld1q_f32(ap);
+                    let b = vld1q_f32(bp);
+                    let c = vld1q_f32(cp);
+                    let s = vld1q_f32(sp);
+                    let ac = vmulq_f32(a, c);
+                    let bs = vmulq_f32(b, s);
+                    let as_val = vmulq_f32(a, s);
+                    let bc = vmulq_f32(b, c);
+                    vst1q_f32(ap, vsubq_f32(ac, bs));
+                    vst1q_f32(bp, vaddq_f32(as_val, bc));
+                    ap = ap.add(4);
+                    bp = bp.add(4);
+                    cp = cp.add(4);
+                    sp = sp.add(4);
+                }
+            }
+            for j in (chunks * 4)..half_dim {
+                let (a, b) = (head[j], head[j + half_dim]);
+                head[j] = a * cos_s[j] - b * sin_s[j];
+                head[j + half_dim] = a * sin_s[j] + b * cos_s[j];
+            }
+            continue;
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        for j in 0..half_dim {
+            let (a, b) = (head[j], head[j + half_dim]);
+            head[j] = a * cos_s[j] - b * sin_s[j];
+            head[j + half_dim] = a * sin_s[j] + b * cos_s[j];
+        }
+    }
+}
+
 fn rope(values: &mut [f32], heads: usize, dim: usize, start: usize, frequencies: &[f32]) {
     let half_dim = dim / 2;
     for (token, row) in values.chunks_exact_mut(heads * dim).enumerate() {
@@ -610,125 +909,101 @@ fn rope(values: &mut [f32], heads: usize, dim: usize, start: usize, frequencies:
             (&cos_vec[..], &sin_vec[..])
         };
 
-        for head in row.chunks_exact_mut(dim) {
-            #[cfg(target_arch = "aarch64")]
-            {
-                use std::arch::aarch64::*;
-                let chunks = half_dim / 4;
-                let mut ap = head.as_mut_ptr();
-                let mut bp = unsafe { ap.add(half_dim) };
-                let mut cp = cos_s.as_ptr();
-                let mut sp = sin_s.as_ptr();
-                unsafe {
-                    for _ in 0..chunks {
-                        let a = vld1q_f32(ap);
-                        let b = vld1q_f32(bp);
-                        let c = vld1q_f32(cp);
-                        let s = vld1q_f32(sp);
-                        let ac = vmulq_f32(a, c);
-                        let bs = vmulq_f32(b, s);
-                        let as_val = vmulq_f32(a, s);
-                        let bc = vmulq_f32(b, c);
-                        vst1q_f32(ap, vsubq_f32(ac, bs));
-                        vst1q_f32(bp, vaddq_f32(as_val, bc));
-                        ap = ap.add(4);
-                        bp = bp.add(4);
-                        cp = cp.add(4);
-                        sp = sp.add(4);
-                    }
-                }
-                for j in (chunks * 4)..half_dim {
-                    let (a, b) = (head[j], head[j + half_dim]);
-                    head[j] = a * cos_s[j] - b * sin_s[j];
-                    head[j + half_dim] = a * sin_s[j] + b * cos_s[j];
-                }
-                continue;
-            }
-            #[cfg(not(target_arch = "aarch64"))]
-            for j in 0..half_dim {
-                let (a, b) = (head[j], head[j + half_dim]);
-                head[j] = a * cos_s[j] - b * sin_s[j];
-                head[j + half_dim] = a * sin_s[j] + b * cos_s[j];
-            }
-        }
+        rope_with_cache(row, heads, dim, cos_s, sin_s);
     }
 }
 
-fn attention(q: &[f32], cache: &KvCache, config: &Config, past: usize) -> Vec<f32> {
+fn attention_into(q: &[f32], cache: &KvCache, config: &Config, past: usize, out: &mut [f32]) {
     let dim = config.head_dim;
     let kv_width = config.kv_heads * dim;
     let repeats = config.heads / config.kv_heads;
     let scale = (dim as f32).sqrt().recip();
-    let mut out = vec![0.; q.len()];
-    out.par_chunks_mut(dim)
-        .enumerate()
-        .for_each(|(index, output)| {
-            let token = index / config.heads;
-            let kv_head = index % config.heads / repeats;
-            let query = &q[index * dim..(index + 1) * dim];
-            let visible = past + token + 1;
-            let mut stack_scores = [0f32; 1024];
-            let mut heap_scores;
-            let scores: &mut [f32] = if visible <= 1024 {
-                &mut stack_scores[..visible]
-            } else {
-                heap_scores = vec![0f32; visible];
-                &mut heap_scores[..]
-            };
-            for (pos, score) in scores.iter_mut().enumerate() {
-                let offset = pos * kv_width + kv_head * dim;
-                *score = dot(query, &cache.keys[offset..offset + dim]) * scale;
-            }
-            let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let mut sum = 0.;
-            for score in scores.iter_mut() {
-                *score = (*score - max).exp();
-                sum += *score;
-            }
-            let inv_sum = sum.recip();
-            for (pos, &score) in scores.iter().enumerate() {
-                let offset = pos * kv_width + kv_head * dim;
-                let p = score * inv_sum;
-                let val_slice = &cache.values[offset..offset + dim];
-                #[cfg(target_arch = "aarch64")]
-                {
-                    use std::arch::aarch64::*;
-                    let pv = unsafe { vdupq_n_f32(p) };
-                    let chunks = dim / 16;
-                    let mut op = output.as_mut_ptr();
-                    let mut vp = val_slice.as_ptr();
-                    unsafe {
-                        for _ in 0..chunks {
-                            let o0 = vld1q_f32(op);
-                            let o1 = vld1q_f32(op.add(4));
-                            let o2 = vld1q_f32(op.add(8));
-                            let o3 = vld1q_f32(op.add(12));
-                            let v0 = vld1q_f32(vp);
-                            let v1 = vld1q_f32(vp.add(4));
-                            let v2 = vld1q_f32(vp.add(8));
-                            let v3 = vld1q_f32(vp.add(12));
-                            vst1q_f32(op, vfmaq_f32(o0, v0, pv));
-                            vst1q_f32(op.add(4), vfmaq_f32(o1, v1, pv));
-                            vst1q_f32(op.add(8), vfmaq_f32(o2, v2, pv));
-                            vst1q_f32(op.add(12), vfmaq_f32(o3, v3, pv));
-                            op = op.add(16);
-                            vp = vp.add(16);
-                        }
+    out.fill(0.);
+
+    let compute_head = |index: usize, output: &mut [f32]| {
+        let token = index / config.heads;
+        let kv_head = index % config.heads / repeats;
+        let query = &q[index * dim..(index + 1) * dim];
+        let visible = past + token + 1;
+        let mut stack_scores = [0f32; 1024];
+        let mut heap_scores;
+        let scores: &mut [f32] = if visible <= 1024 {
+            &mut stack_scores[..visible]
+        } else {
+            heap_scores = vec![0f32; visible];
+            &mut heap_scores[..]
+        };
+        for (pos, score) in scores.iter_mut().enumerate() {
+            let offset = pos * kv_width + kv_head * dim;
+            *score = dot(query, &cache.keys[offset..offset + dim]) * scale;
+        }
+        let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.;
+        for score in scores.iter_mut() {
+            *score = (*score - max).exp();
+            sum += *score;
+        }
+        let inv_sum = sum.recip();
+        for (pos, &score) in scores.iter().enumerate() {
+            let offset = pos * kv_width + kv_head * dim;
+            let p = score * inv_sum;
+            let val_slice = &cache.values[offset..offset + dim];
+            #[cfg(target_arch = "aarch64")]
+            {
+                use std::arch::aarch64::*;
+                let pv = unsafe { vdupq_n_f32(p) };
+                let chunks = dim / 16;
+                let mut op = output.as_mut_ptr();
+                let mut vp = val_slice.as_ptr();
+                unsafe {
+                    for _ in 0..chunks {
+                        let o0 = vld1q_f32(op);
+                        let o1 = vld1q_f32(op.add(4));
+                        let o2 = vld1q_f32(op.add(8));
+                        let o3 = vld1q_f32(op.add(12));
+                        let v0 = vld1q_f32(vp);
+                        let v1 = vld1q_f32(vp.add(4));
+                        let v2 = vld1q_f32(vp.add(8));
+                        let v3 = vld1q_f32(vp.add(12));
+                        vst1q_f32(op, vfmaq_f32(o0, v0, pv));
+                        vst1q_f32(op.add(4), vfmaq_f32(o1, v1, pv));
+                        vst1q_f32(op.add(8), vfmaq_f32(o2, v2, pv));
+                        vst1q_f32(op.add(12), vfmaq_f32(o3, v3, pv));
+                        op = op.add(16);
+                        vp = vp.add(16);
                     }
-                    for (out_val, &val) in output[chunks * 16..]
-                        .iter_mut()
-                        .zip(&val_slice[chunks * 16..])
-                    {
-                        *out_val += p * val;
-                    }
-                    continue;
                 }
-                #[cfg(not(target_arch = "aarch64"))]
-                for (out_val, &val) in output.iter_mut().zip(val_slice) {
+                for (out_val, &val) in output[chunks * 16..]
+                    .iter_mut()
+                    .zip(&val_slice[chunks * 16..])
+                {
                     *out_val += p * val;
                 }
+                continue;
             }
-        });
+            #[cfg(not(target_arch = "aarch64"))]
+            for (out_val, &val) in output.iter_mut().zip(val_slice) {
+                *out_val += p * val;
+            }
+        }
+    };
+
+    if q.len() == config.heads * dim && past < 64 {
+        for (index, output) in out.chunks_mut(dim).enumerate() {
+            compute_head(index, output);
+        }
+    } else {
+        out.par_chunks_mut(dim)
+            .enumerate()
+            .for_each(|(index, output)| {
+                compute_head(index, output);
+            });
+    }
+}
+
+fn attention(q: &[f32], cache: &KvCache, config: &Config, past: usize) -> Vec<f32> {
+    let mut out = vec![0.; q.len()];
+    attention_into(q, cache, config, past, &mut out);
     out
 }
 
