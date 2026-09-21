@@ -199,12 +199,17 @@ fn bench(args: Bench) -> Result<()> {
         sampling,
         stop: vec![],
     };
-    let pool = ThreadPoolBuilder::new().num_threads(args.threads).build()?;
+    set_high_priority();
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(args.threads)
+        .start_handler(|_| set_high_priority())
+        .build()?;
     let wall_start = Instant::now();
     let runs = std::thread::scope(|scope| -> Result<Vec<_>> {
         let handles: Vec<_> = (0..args.concurrency)
             .map(|_| {
                 scope.spawn(|| {
+                    set_high_priority();
                     Generator::with_pool(&model, &pool).generate(
                         &prompt,
                         args.ctx_size,
@@ -239,6 +244,20 @@ fn bench(args: Bench) -> Result<()> {
     );
     Ok(())
 }
+
+#[cfg(target_os = "macos")]
+fn set_high_priority() {
+    unsafe extern "C" {
+        fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+    }
+    // QOS_CLASS_USER_INTERACTIVE = 0x21
+    unsafe {
+        pthread_set_qos_class_self_np(0x21, 0);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_high_priority() {}
 
 #[cfg(unix)]
 fn peak_rss_bytes() -> Option<u64> {

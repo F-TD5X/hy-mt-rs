@@ -3,7 +3,7 @@
 //! Q4_K/Q6_K layouts and the STQ codebook follow ggml's MIT-licensed
 //! reference routines. See THIRD_PARTY_NOTICES.md and docs/reference.md.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use anyhow::{Result, bail, ensure};
 use candle_core::{Device, Tensor};
@@ -143,6 +143,76 @@ impl Weight {
             self.name()
         );
         let row_bytes = cols / self.dtype().block_len() * self.dtype().block_bytes();
+
+        if batch == 1 {
+            let mut out = vec![0.; rows];
+            let num_threads = rayon::current_num_threads();
+            let target_chunks = (num_threads * 4).max(1);
+            let chunk_size = (rows / target_chunks).clamp(32, 2048);
+            match self.dtype() {
+                DType::STQ1_0 => {
+                    out.par_chunks_mut(chunk_size)
+                        .enumerate()
+                        .for_each(|(chunk_idx, chunk)| {
+                            let base_row = chunk_idx * chunk_size;
+                            for (i, val) in chunk.iter_mut().enumerate() {
+                                let row = base_row + i;
+                                let bytes = &self.bytes()[row * row_bytes..(row + 1) * row_bytes];
+                                *val = stq_row_dot(bytes, input);
+                            }
+                        });
+                }
+                DType::Q6_K => {
+                    out.par_chunks_mut(chunk_size)
+                        .enumerate()
+                        .for_each(|(chunk_idx, chunk)| {
+                            let base_row = chunk_idx * chunk_size;
+                            for (i, val) in chunk.iter_mut().enumerate() {
+                                let row = base_row + i;
+                                let bytes = &self.bytes()[row * row_bytes..(row + 1) * row_bytes];
+                                *val = q6_row_dot(bytes, input);
+                            }
+                        });
+                }
+                DType::F32 | DType::F16 => {
+                    out.par_chunks_mut(chunk_size)
+                        .enumerate()
+                        .for_each(|(chunk_idx, chunk)| {
+                            let base_row = chunk_idx * chunk_size;
+                            let mut values = vec![0.; cols];
+                            for (i, val) in chunk.iter_mut().enumerate() {
+                                let row = base_row + i;
+                                let bytes = &self.bytes()[row * row_bytes..(row + 1) * row_bytes];
+                                decode_unchecked(self.dtype(), bytes, &mut values);
+                                *val = dot(&values, input);
+                            }
+                        });
+                }
+                _ => {
+                    out.par_chunks_mut(chunk_size)
+                        .enumerate()
+                        .for_each(|(chunk_idx, chunk)| {
+                            let base_row = chunk_idx * chunk_size;
+                            let mut scratch = [0f32; 512];
+                            let block_len = self.dtype().block_len();
+                            let block_bytes = self.dtype().block_bytes();
+                            for (i, val) in chunk.iter_mut().enumerate() {
+                                let row = base_row + i;
+                                let bytes = &self.bytes()[row * row_bytes..(row + 1) * row_bytes];
+                                let mut sum = 0.0;
+                                for (block, b_bytes) in bytes.chunks_exact(block_bytes).enumerate() {
+                                    let start = block * block_len;
+                                    decode_unchecked(self.dtype(), b_bytes, &mut scratch[..block_len]);
+                                    sum += dot(&scratch[..block_len], &input[start..start + block_len]);
+                                }
+                                *val = sum;
+                            }
+                        });
+                }
+            }
+            return Ok(out);
+        }
+
         // Output-major scratch permits independent weight rows without a lock.
         let mut transposed = vec![0.; rows * batch];
         if batch >= 8 {
@@ -167,53 +237,17 @@ impl Weight {
                     Ok(())
                 })?;
         } else {
-            // Rows are independent, but one rayon task per row is too fine for
-            // the short projections, so tiles of rows share the scheduling cost.
             transposed
                 .par_chunks_mut(32 * batch)
                 .enumerate()
                 .for_each(|(tile, tile_out)| {
-                    let mut scratch = [0f32; 512];
-                    let block_len = self.dtype().block_len();
-                    for (row, output) in tile_out.chunks_mut(batch).enumerate() {
-                        let row = tile * 32 + row;
+                    let mut scratch = vec![0f32; cols];
+                    for (row_idx, output) in tile_out.chunks_mut(batch).enumerate() {
+                        let row = tile * 32 + row_idx;
                         let bytes = &self.bytes()[row * row_bytes..(row + 1) * row_bytes];
-                        if matches!(self.dtype(), DType::F32 | DType::F16) {
-                            // Decode a row once for unquantized matrices such as the router.
-                            let mut values = vec![0.; cols];
-                            decode_unchecked(self.dtype(), bytes, &mut values);
-                            for (b, out) in output.iter_mut().enumerate() {
-                                *out = dot(&values, &input[b * cols..(b + 1) * cols]);
-                            }
-                            continue;
-                        }
-                        for (block, bytes) in
-                            bytes.chunks_exact(self.dtype().block_bytes()).enumerate()
-                        {
-                            let start = block * block_len;
-                            // STQ digits are ±1/0, so the fused kernel gathers
-                            // and accumulates without a decoded f32 buffer.
-                            if self.dtype() == DType::STQ1_0 {
-                                let d = half(&bytes[40..]);
-                                for (b, out) in output.iter_mut().enumerate() {
-                                    let xs = &input[b * cols + start..start + block_len];
-                                    *out += d * stq_dot(bytes, xs);
-                                }
-                                continue;
-                            }
-                            if self.dtype() == DType::Q6_K {
-                                for (b, out) in output.iter_mut().enumerate() {
-                                    let xs = &input[b * cols + start..start + block_len];
-                                    *out += q6_dot(bytes, xs);
-                                }
-                                continue;
-                            }
-                            decode_unchecked(self.dtype(), bytes, &mut scratch[..block_len]);
-                            for (b, out) in output.iter_mut().enumerate() {
-                                let start = b * cols + start;
-                                *out +=
-                                    dot(&scratch[..block_len], &input[start..start + block_len]);
-                            }
+                        decode_unchecked(self.dtype(), bytes, &mut scratch);
+                        for (b, out) in output.iter_mut().enumerate() {
+                            *out = dot(&scratch, &input[b * cols..(b + 1) * cols]);
                         }
                     }
                 });
@@ -226,10 +260,79 @@ impl Weight {
         }
         Ok(out)
     }
+
+    /// Fused gate and up projection with SiLU activation: `silu(gate(x)) * up(x)`.
+    pub fn matmul_gate_up_silu(&self, up: &Weight, input: &[f32]) -> Result<Vec<f32>> {
+        let (cols, rows) = (self.shape()[0], self.shape()[1]);
+        ensure!(
+            up.shape() == self.shape(),
+            "gate and up shape mismatch"
+        );
+        ensure!(
+            input.len() == cols,
+            "invalid activation shape for gate_up_silu"
+        );
+        let row_bytes = cols / self.dtype().block_len() * self.dtype().block_bytes();
+        let mut out = vec![0.; rows];
+        let num_threads = rayon::current_num_threads();
+        let target_chunks = (num_threads * 4).max(1);
+        let chunk_size = (rows / target_chunks).clamp(32, 2048);
+
+        match (self.dtype(), up.dtype()) {
+            (DType::STQ1_0, DType::STQ1_0) => {
+                out.par_chunks_mut(chunk_size)
+                    .enumerate()
+                    .for_each(|(chunk_idx, chunk)| {
+                        let base_row = chunk_idx * chunk_size;
+                        for (i, val) in chunk.iter_mut().enumerate() {
+                            let row = base_row + i;
+                            let g_bytes = &self.bytes()[row * row_bytes..(row + 1) * row_bytes];
+                            let u_bytes = &up.bytes()[row * row_bytes..(row + 1) * row_bytes];
+                            let g = stq_row_dot(g_bytes, input);
+                            let u = stq_row_dot(u_bytes, input);
+                            let silu = g / (1.0 + (-g).exp());
+                            *val = silu * u;
+                        }
+                    });
+            }
+            (DType::Q6_K, DType::Q6_K) => {
+                out.par_chunks_mut(chunk_size)
+                    .enumerate()
+                    .for_each(|(chunk_idx, chunk)| {
+                        let base_row = chunk_idx * chunk_size;
+                        for (i, val) in chunk.iter_mut().enumerate() {
+                            let row = base_row + i;
+                            let g_bytes = &self.bytes()[row * row_bytes..(row + 1) * row_bytes];
+                            let u_bytes = &up.bytes()[row * row_bytes..(row + 1) * row_bytes];
+                            let g = q6_row_dot(g_bytes, input);
+                            let u = q6_row_dot(u_bytes, input);
+                            let silu = g / (1.0 + (-g).exp());
+                            *val = silu * u;
+                        }
+                    });
+            }
+            _ => {
+                let mut gate = self.matmul(input, 1)?;
+                let up_out = up.matmul(input, 1)?;
+                for (g, u) in gate.iter_mut().zip(up_out) {
+                    *g = (*g / (1. + (-*g).exp())) * u;
+                }
+                return Ok(gate);
+            }
+        }
+        Ok(out)
+    }
 }
 
+#[inline(always)]
 fn half(bytes: &[u8]) -> f32 {
     f16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).to_f32()
+}
+
+#[inline(always)]
+unsafe fn half_raw(ptr: *const u8) -> f32 {
+    let bits = unsafe { (ptr as *const u16).read_unaligned() };
+    f16::from_bits(u16::from_le(bits)).to_f32()
 }
 
 pub fn decode(dtype: DType, bytes: &[u8], out: &mut [f32]) -> Result<()> {
@@ -260,11 +363,23 @@ const STQ_CODEBOOK: [u8; 32] = [
 /// auto-vectorizes. `scale` folds the block's FP16 factor into each digit.
 fn stq_digits(bytes: &[u8], scale: f32, out: &mut [f32]) {
     debug_assert_eq!(out.len(), 256);
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: out has len 256, bytes has len at least 42.
+        unsafe { stq_digits_neon(bytes, scale, out) };
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    stq_digits_scalar(bytes, scale, out);
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn stq_digits_scalar(bytes: &[u8], scale: f32, out: &mut [f32]) {
     let mut packed = [0u8; 64];
     for (c, chunk) in packed.as_chunks_mut::<16>().0.iter_mut().enumerate() {
         for (j, slot) in chunk.iter_mut().enumerate() {
             let g = c * 16 + j;
-            let code = (bytes[g >> 1] >> (4 * (g & 1))) & 15;
+            let code = (bytes[g >> 1] >> (4 * (g % 2))) & 15;
             let sign = (bytes[32 + (g >> 3)] >> (g & 7)) & 1;
             *slot = STQ_CODEBOOK[((sign << 4) | code) as usize];
         }
@@ -280,28 +395,199 @@ fn stq_digits(bytes: &[u8], scale: f32, out: &mut [f32]) {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn stq_digits_neon(bytes: &[u8], scale: f32, out: &mut [f32]) {
+    use std::arch::aarch64::*;
+    unsafe {
+        let cbs = uint8x16x2_t(
+            vld1q_u8(STQ_CODEBOOK.as_ptr()),
+            vld1q_u8(STQ_CODEBOOK.as_ptr().add(16)),
+        );
+        let shifts: [i8; 8] = [0, -1, -2, -3, -4, -5, -6, -7];
+        let shifts = vld1_s8(shifts.as_ptr());
+        let one = vdupq_n_u8(1);
+        let mask15 = vdup_n_u8(15);
+        let mask1 = vdupq_n_u8(1);
+        let mask3 = vdupq_n_u8(3);
+        let scale_vec = vdupq_n_f32(scale);
+        let out_ptr = out.as_mut_ptr();
+
+        for c in 0..4usize {
+            let cw = vld1_u8(bytes.as_ptr().add(8 * c));
+            let lo = vand_u8(cw, mask15);
+            let hi = vshr_n_u8(cw, 4);
+            let codes = vcombine_u8(vzip1_u8(lo, hi), vzip2_u8(lo, hi));
+            let s0 = vshl_u8(vdup_n_u8(bytes[32 + 2 * c]), shifts);
+            let s1 = vshl_u8(vdup_n_u8(bytes[33 + 2 * c]), shifts);
+            let signs = vshlq_n_u8(vandq_u8(vcombine_u8(s0, s1), mask1), 4);
+            let packed = vqtbl2q_u8(cbs, vorrq_u8(codes, signs));
+
+            let t8_0 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(packed, mask3), one));
+            let lo8_0 = vmovl_s8(vget_low_s8(t8_0));
+            let hi8_0 = vmovl_s8(vget_high_s8(t8_0));
+            let dst0 = out_ptr.add(c * 64);
+            vst1q_f32(dst0, vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_0))), scale_vec));
+            vst1q_f32(dst0.add(4), vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo8_0))), scale_vec));
+            vst1q_f32(dst0.add(8), vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_0))), scale_vec));
+            vst1q_f32(dst0.add(12), vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi8_0))), scale_vec));
+
+            let t8_1 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(vshrq_n_u8(packed, 2), mask3), one));
+            let lo8_1 = vmovl_s8(vget_low_s8(t8_1));
+            let hi8_1 = vmovl_s8(vget_high_s8(t8_1));
+            let dst1 = dst0.add(16);
+            vst1q_f32(dst1, vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_1))), scale_vec));
+            vst1q_f32(dst1.add(4), vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo8_1))), scale_vec));
+            vst1q_f32(dst1.add(8), vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_1))), scale_vec));
+            vst1q_f32(dst1.add(12), vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi8_1))), scale_vec));
+
+            let t8_2 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(vshrq_n_u8(packed, 4), mask3), one));
+            let lo8_2 = vmovl_s8(vget_low_s8(t8_2));
+            let hi8_2 = vmovl_s8(vget_high_s8(t8_2));
+            let dst2 = dst0.add(32);
+            vst1q_f32(dst2, vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_2))), scale_vec));
+            vst1q_f32(dst2.add(4), vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo8_2))), scale_vec));
+            vst1q_f32(dst2.add(8), vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_2))), scale_vec));
+            vst1q_f32(dst2.add(12), vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi8_2))), scale_vec));
+
+            let t8_3 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(vshrq_n_u8(packed, 6), mask3), one));
+            let lo8_3 = vmovl_s8(vget_low_s8(t8_3));
+            let hi8_3 = vmovl_s8(vget_high_s8(t8_3));
+            let dst3 = dst0.add(48);
+            vst1q_f32(dst3, vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_3))), scale_vec));
+            vst1q_f32(dst3.add(4), vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo8_3))), scale_vec));
+            vst1q_f32(dst3.add(8), vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_3))), scale_vec));
+            vst1q_f32(dst3.add(12), vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi8_3))), scale_vec));
+        }
+    }
+}
+
+#[allow(dead_code)]
 type StqDot = fn(&[u8], &[f32]) -> f32;
-static STQ_DOT: OnceLock<StqDot> = OnceLock::new();
 
 /// Dot one 42-byte STQ block (256 ternary weights) against 256 activations.
 /// Returns the unscaled sum; the block's FP16 scale is applied by the caller.
+#[allow(dead_code)]
 pub(crate) fn stq_dot(bytes: &[u8], x: &[f32]) -> f32 {
     debug_assert_eq!(bytes.len(), 42);
     debug_assert_eq!(x.len(), 256);
-    STQ_DOT.get_or_init(|| {
-        #[cfg(target_arch = "aarch64")]
-        if std::arch::is_aarch64_feature_detected!("neon") {
-            return |a, b| {
-                // SAFETY: selected only when NEON is available; sizes match.
-                unsafe { stq_dot_neon(a, b) }
-            };
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: callers pass a 42-byte block and exactly 256 activations.
+        unsafe { stq_dot_neon(bytes, x) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let mut digits = [0f32; 256];
+        stq_digits(bytes, 1., &mut digits);
+        dot(&digits, x)
+    }
+}
+
+
+
+#[inline(always)]
+pub(crate) fn stq_row_dot(row_bytes: &[u8], x: &[f32]) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { stq_row_dot_neon(row_bytes, x) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let mut sum = 0.0;
+        for (block, bytes) in row_bytes.chunks_exact(42).enumerate() {
+            let d = half(&bytes[40..]);
+            let xs = &x[block * 256..(block + 1) * 256];
+            sum += d * stq_dot(bytes, xs);
         }
-        |a, b| {
-            let mut digits = [0f32; 256];
-            stq_digits(a, 1., &mut digits);
-            dot(&digits, b)
+        sum
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn stq_row_dot_neon(row_bytes: &[u8], x: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+    unsafe {
+        let cbs = uint8x16x2_t(
+            vld1q_u8(STQ_CODEBOOK.as_ptr()),
+            vld1q_u8(STQ_CODEBOOK.as_ptr().add(16)),
+        );
+        let shifts: [i8; 8] = [0, -1, -2, -3, -4, -5, -6, -7];
+        let shifts = vld1_s8(shifts.as_ptr());
+        let one = vdupq_n_u8(1);
+        let mut row_acc = vdupq_n_f32(0.);
+
+        let num_blocks = row_bytes.len() / 42;
+        let mut bytes_ptr = row_bytes.as_ptr();
+        let mut x_ptr = x.as_ptr();
+
+        for _ in 0..num_blocks {
+            let d = half(std::slice::from_raw_parts(bytes_ptr.add(40), 2));
+            let mut a0 = vdupq_n_f32(0.);
+            let mut a1 = vdupq_n_f32(0.);
+            let mut a2 = vdupq_n_f32(0.);
+            let mut a3 = vdupq_n_f32(0.);
+
+            for c in 0..4usize {
+                let cw = vld1_u8(bytes_ptr.add(8 * c));
+                let lo = vand_u8(cw, vdup_n_u8(15));
+                let hi = vshr_n_u8(cw, 4);
+                let codes = vcombine_u8(vzip1_u8(lo, hi), vzip2_u8(lo, hi));
+                let s0 = vshl_u8(vdup_n_u8(*bytes_ptr.add(32 + 2 * c)), shifts);
+                let s1 = vshl_u8(vdup_n_u8(*bytes_ptr.add(33 + 2 * c)), shifts);
+                let signs = vcombine_u8(
+                    vshl_n_u8(vand_u8(s0, vdup_n_u8(1)), 4),
+                    vshl_n_u8(vand_u8(s1, vdup_n_u8(1)), 4),
+                );
+                let packed = vqtbl2q_u8(cbs, vorrq_u8(codes, signs));
+
+                let t8_0 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(packed, vdupq_n_u8(3)), one));
+                let lo8_0 = vmovl_s8(vget_low_s8(t8_0));
+                let hi8_0 = vmovl_s8(vget_high_s8(t8_0));
+                let xs0 = x_ptr.add(c * 64);
+                a0 = vfmaq_f32(a0, vld1q_f32(xs0), vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_0))));
+                a1 = vfmaq_f32(a1, vld1q_f32(xs0.add(4)), vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo8_0))));
+                a2 = vfmaq_f32(a2, vld1q_f32(xs0.add(8)), vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_0))));
+                a3 = vfmaq_f32(a3, vld1q_f32(xs0.add(12)), vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi8_0))));
+
+                let t8_1 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(vshrq_n_u8(packed, 2), vdupq_n_u8(3)), one));
+                let lo8_1 = vmovl_s8(vget_low_s8(t8_1));
+                let hi8_1 = vmovl_s8(vget_high_s8(t8_1));
+                let xs1 = xs0.add(16);
+                a0 = vfmaq_f32(a0, vld1q_f32(xs1), vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_1))));
+                a1 = vfmaq_f32(a1, vld1q_f32(xs1.add(4)), vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo8_1))));
+                a2 = vfmaq_f32(a2, vld1q_f32(xs1.add(8)), vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_1))));
+                a3 = vfmaq_f32(a3, vld1q_f32(xs1.add(12)), vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi8_1))));
+
+                let t8_2 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(vshrq_n_u8(packed, 4), vdupq_n_u8(3)), one));
+                let lo8_2 = vmovl_s8(vget_low_s8(t8_2));
+                let hi8_2 = vmovl_s8(vget_high_s8(t8_2));
+                let xs2 = xs0.add(32);
+                a0 = vfmaq_f32(a0, vld1q_f32(xs2), vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_2))));
+                a1 = vfmaq_f32(a1, vld1q_f32(xs2.add(4)), vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo8_2))));
+                a2 = vfmaq_f32(a2, vld1q_f32(xs2.add(8)), vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_2))));
+                a3 = vfmaq_f32(a3, vld1q_f32(xs2.add(12)), vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi8_2))));
+
+                let t8_3 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(vshrq_n_u8(packed, 6), vdupq_n_u8(3)), one));
+                let lo8_3 = vmovl_s8(vget_low_s8(t8_3));
+                let hi8_3 = vmovl_s8(vget_high_s8(t8_3));
+                let xs3 = xs0.add(48);
+                a0 = vfmaq_f32(a0, vld1q_f32(xs3), vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_3))));
+                a1 = vfmaq_f32(a1, vld1q_f32(xs3.add(4)), vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo8_3))));
+                a2 = vfmaq_f32(a2, vld1q_f32(xs3.add(8)), vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_3))));
+                a3 = vfmaq_f32(a3, vld1q_f32(xs3.add(12)), vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi8_3))));
+            }
+
+            let block_sum = vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3));
+            row_acc = vfmaq_n_f32(row_acc, block_sum, d);
+
+            bytes_ptr = bytes_ptr.add(42);
+            x_ptr = x_ptr.add(256);
         }
-    })(bytes, x)
+
+        vaddvq_f32(row_acc)
+    }
 }
 /// Fused NEON kernel: gathers codebook bytes with a 32-entry table lookup,
 /// extracts each 2-bit lane, and FMA-accumulates against the activations.
@@ -376,28 +662,114 @@ unsafe fn stq_dot_neon(bytes: &[u8], x: &[f32]) -> f32 {
     }
 }
 
+#[allow(dead_code)]
 type Q6Dot = fn(&[u8], &[f32]) -> f32;
-static Q6_DOT: OnceLock<Q6Dot> = OnceLock::new();
 
 /// Dot one 210-byte Q6_K block (256 weights) against 256 activations,
 /// including the block's FP16 scale.
+#[allow(dead_code)]
 pub(crate) fn q6_dot(bytes: &[u8], x: &[f32]) -> f32 {
     debug_assert_eq!(bytes.len(), 210);
     debug_assert_eq!(x.len(), 256);
-    Q6_DOT.get_or_init(|| {
-        #[cfg(target_arch = "aarch64")]
-        if std::arch::is_aarch64_feature_detected!("neon") {
-            return |a, b| {
-                // SAFETY: selected only when NEON is available; sizes match.
-                unsafe { q6_dot_neon(a, b) }
-            };
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: callers pass a 210-byte block and exactly 256 activations.
+        unsafe { q6_dot_neon(bytes, x) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let mut decoded = [0f32; 256];
+        decode_unchecked(DType::Q6_K, bytes, &mut decoded);
+        dot(&decoded, x)
+    }
+}
+
+#[inline(always)]
+pub(crate) fn q6_row_dot(row_bytes: &[u8], x: &[f32]) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { q6_row_dot_neon(row_bytes, x) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let mut sum = 0.0;
+        for (block, bytes) in row_bytes.chunks_exact(210).enumerate() {
+            let xs = &x[block * 256..(block + 1) * 256];
+            sum += q6_dot(bytes, xs);
         }
-        |a, b| {
-            let mut decoded = [0f32; 256];
-            decode_unchecked(DType::Q6_K, a, &mut decoded);
-            dot(&decoded, b)
+        sum
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn q6_row_dot_neon(row_bytes: &[u8], x: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+    unsafe {
+        let (mut a0, mut a1, mut a2, mut a3) = (
+            vdupq_n_f32(0.),
+            vdupq_n_f32(0.),
+            vdupq_n_f32(0.),
+            vdupq_n_f32(0.),
+        );
+        let num_blocks = row_bytes.len() / 210;
+        let mut bytes_ptr = row_bytes.as_ptr();
+        let mut x_ptr = x.as_ptr();
+
+        for _ in 0..num_blocks {
+            let d = half_raw(bytes_ptr.add(208));
+            for c in 0..2usize {
+                let ql = bytes_ptr.add(c * 64);
+                let qh = bytes_ptr.add(128 + c * 32);
+                let sc = bytes_ptr.add(192 + c * 8);
+                for p in 0..4usize {
+                    for h in 0..2usize {
+                        let qlv = vld1q_u8(ql.add((p & 1) * 32 + h * 16));
+                        let qhv = vld1q_u8(qh.add(h * 16));
+                        let lo6 = match p {
+                            2 | 3 => vandq_u8(vshrq_n_u8(qlv, 4), vdupq_n_u8(15)),
+                            _ => vandq_u8(qlv, vdupq_n_u8(15)),
+                        };
+                        let bits = match p {
+                            0 => qhv,
+                            1 => vshrq_n_u8(qhv, 2),
+                            2 => vshrq_n_u8(qhv, 4),
+                            _ => vshrq_n_u8(qhv, 6),
+                        };
+                        let q6 = vorrq_u8(lo6, vshlq_n_u8(vandq_u8(bits, vdupq_n_u8(3)), 4));
+                        let t8 = vreinterpretq_s8_u8(vsubq_u8(q6, vdupq_n_u8(32)));
+                        let s = vdupq_n_f32(d * (*sc.add(2 * p + h) as i8) as f32);
+                        let lo8 = vmovl_s8(vget_low_s8(t8));
+                        let hi8 = vmovl_s8(vget_high_s8(t8));
+                        let base = x_ptr.add(c * 128 + p * 32 + h * 16);
+                        a0 = vfmaq_f32(
+                            a0,
+                            vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8))), s),
+                            vld1q_f32(base),
+                        );
+                        a1 = vfmaq_f32(
+                            a1,
+                            vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo8))), s),
+                            vld1q_f32(base.add(4)),
+                        );
+                        a2 = vfmaq_f32(
+                            a2,
+                            vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8))), s),
+                            vld1q_f32(base.add(8)),
+                        );
+                        a3 = vfmaq_f32(
+                            a3,
+                            vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi8))), s),
+                            vld1q_f32(base.add(12)),
+                        );
+                    }
+                }
+            }
+            bytes_ptr = bytes_ptr.add(210);
+            x_ptr = x_ptr.add(256);
         }
-    })(bytes, x)
+        vaddvq_f32(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)))
+    }
 }
 
 /// Fused NEON kernel for Q6_K: bit-extract each 6-bit code, apply the plane
@@ -543,8 +915,7 @@ fn decode_unchecked(dtype: DType, bytes: &[u8], out: &mut [f32]) {
     }
 }
 
-type Dot = fn(&[f32], &[f32]) -> f32;
-static DOT: OnceLock<Dot> = OnceLock::new();
+
 
 pub fn kernel_name() -> &'static str {
     #[cfg(target_arch = "aarch64")]
@@ -560,24 +931,20 @@ pub fn kernel_name() -> &'static str {
 
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
-    DOT.get_or_init(|| {
-        #[cfg(target_arch = "aarch64")]
-        if std::arch::is_aarch64_feature_detected!("neon") {
-            return |a, b| {
-                // SAFETY: selected only when NEON is available; lengths match.
-                unsafe { dot_neon(a, b) }
-            };
-        }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: on aarch64, NEON is always available; lengths match.
+        unsafe { dot_neon(a, b) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
         #[cfg(target_arch = "x86_64")]
         if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
         {
-            return |a, b| {
-                // SAFETY: selected only when AVX2 and FMA are available; lengths match.
-                unsafe { dot_avx2(a, b) }
-            };
+            return unsafe { dot_avx2(a, b) };
         }
-        dot_scalar
-    })(a, b)
+        dot_scalar(a, b)
+    }
 }
 
 pub fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {

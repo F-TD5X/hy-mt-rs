@@ -425,6 +425,10 @@ impl KvCache {
 
 impl DenseFfn {
     fn forward(&self, input: &[f32], batch: usize) -> Result<Vec<f32>> {
+        if batch == 1 {
+            let gate = self.gate.matmul_gate_up_silu(&self.up, input)?;
+            return self.down.matmul(&gate, 1);
+        }
         let mut gate = self.gate.matmul(input, batch)?;
         let up = self.up.matmul(input, batch)?;
         for (g, u) in gate.iter_mut().zip(up) {
@@ -568,22 +572,30 @@ fn attention(q: &[f32], cache: &KvCache, config: &Config, past: usize) -> Vec<f3
             let kv_head = index % config.heads / repeats;
             let query = &q[index * dim..(index + 1) * dim];
             let visible = past + token + 1;
-            let mut scores = Vec::with_capacity(visible);
+            let mut stack_scores = [0f32; 1024];
+            let mut heap_scores;
+            let scores: &mut [f32] = if visible <= 1024 {
+                &mut stack_scores[..visible]
+            } else {
+                heap_scores = vec![0f32; visible];
+                &mut heap_scores[..]
+            };
             for pos in 0..visible {
                 let offset = pos * kv_width + kv_head * dim;
-                scores.push(dot(query, &cache.keys[offset..offset + dim]) * scale);
+                scores[pos] = dot(query, &cache.keys[offset..offset + dim]) * scale;
             }
             let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let mut sum = 0.;
-            for score in &mut scores {
+            for score in scores.iter_mut() {
                 *score = (*score - max).exp();
                 sum += *score;
             }
-            for (pos, score) in scores.into_iter().enumerate() {
+            let inv_sum = sum.recip();
+            for (pos, &score) in scores.iter().enumerate() {
                 let offset = pos * kv_width + kv_head * dim;
-                let p = score / sum;
-                for (out, value) in output.iter_mut().zip(&cache.values[offset..offset + dim]) {
-                    *out += p * value;
+                let p = score * inv_sum;
+                for (out_val, &val) in output.iter_mut().zip(&cache.values[offset..offset + dim]) {
+                    *out_val += p * val;
                 }
             }
         });

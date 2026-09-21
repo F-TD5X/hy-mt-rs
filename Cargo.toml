@@ -13,7 +13,7 @@ axum = "0.8"
 # This pinned upstream revision uses the Rust fancy-regex backend instead.
 candle-core = { git = "https://github.com/huggingface/candle", rev = "ddf1b879dc3a1760cbcb3f3c4a7c6467850cec4a", default-features = false }
 clap = { version = "4", features = ["derive"] }
-half = "2"
+half = { version = "2", features = ["use-intrinsics"] }
 libc = "0.2"
 memmap2 = "0.9"
 minijinja = { version = "2", features = ["json"] }
@@ -21,7 +21,7 @@ rand = "0.9"
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = { version = "0.10", features = ["asm"] }
 tokenizers = { version = "=0.23.1", default-features = false, features = ["fancy-regex"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 tokio-stream = "0.1"
