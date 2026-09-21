@@ -1,0 +1,24 @@
+# Version control
+.git
+.gitignore
+
+# Rust build artifacts
+target/
+
+# Local data and cache
+.cache/
+data/
+*.part
+
+# Local GGUF models and fixtures
+models/
+*.gguf
+
+# Documentation and tests not needed for compilation
+docs/
+tests/
+examples/
+scripts/
+
+# GitHub configuration
+.github/
