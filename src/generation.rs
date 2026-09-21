@@ -157,7 +157,8 @@ impl Generator<'_> {
         let started = Instant::now();
         let mut session = model.new_session(context)?;
         let mut sampler = Sampler::new(options.sampling.clone(), model.config.vocab_size, prompt)?;
-        let mut logits = self.compute(|| model.prefill(&mut session, prompt, cancel))?;
+        let mut logits = vec![0.; model.config.vocab_size];
+        self.compute(|| model.prefill_into(&mut session, prompt, &mut logits, cancel))?;
         let prefill_ms = started.elapsed().as_secs_f64() * 1000.;
         let mut first_token_ms = prefill_ms;
         let mut token_ids = Vec::new();
@@ -183,7 +184,7 @@ impl Generator<'_> {
                 break;
             }
             if step + 1 < options.max_tokens {
-                logits = self.compute(|| model.forward(&mut session, &[token], cancel))?;
+                self.compute(|| model.forward_into(&mut session, &[token], cancel, &mut logits))?;
             }
         }
         let tail = output.finish();
@@ -226,6 +227,7 @@ struct Sampler {
     params: Sampling,
     rng: StdRng,
     seen: Vec<bool>,
+    ranked: Vec<(usize, f32)>,
 }
 
 impl Sampler {
@@ -239,7 +241,17 @@ impl Sampler {
         let rng = params
             .seed
             .map_or_else(StdRng::from_os_rng, StdRng::seed_from_u64);
-        Ok(Self { params, rng, seen })
+        let ranked = if params.temperature > 0. {
+            Vec::with_capacity(vocab)
+        } else {
+            Vec::new()
+        };
+        Ok(Self {
+            params,
+            rng,
+            seen,
+            ranked,
+        })
     }
 
     fn sample(&mut self, logits: &mut [f32]) -> Result<u32> {
@@ -271,37 +283,43 @@ impl Sampler {
                 .expect("nonempty logits")
                 .0
         } else {
-            let mut ranked: Vec<_> = logits.iter().copied().enumerate().collect();
-            ranked.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-            if self.params.top_k > 0 {
-                ranked.truncate(self.params.top_k as usize);
+            self.ranked.clear();
+            self.ranked.extend(logits.iter().copied().enumerate());
+            if self.params.top_k > 0 && (self.params.top_k as usize) < self.ranked.len() {
+                let k = self.params.top_k as usize;
+                self.ranked.select_nth_unstable_by(k, |a, b| {
+                    b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0))
+                });
+                self.ranked.truncate(k);
             }
-            let max = ranked[0].1;
+            self.ranked
+                .sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            let max = self.ranked[0].1;
             let mut sum = 0.;
-            for (_, p) in &mut ranked {
+            for (_, p) in &mut self.ranked {
                 *p = ((*p - max) / self.params.temperature).exp();
                 sum += *p;
             }
             let threshold = self.params.top_p * sum;
             let mut retained_sum = 0.;
             let mut count = 0;
-            for (_, p) in &ranked {
+            for (_, p) in &self.ranked {
                 retained_sum += p;
                 count += 1;
                 if retained_sum >= threshold {
                     break;
                 }
             }
-            ranked.truncate(count);
+            self.ranked.truncate(count);
             let target = self.rng.random::<f32>() * retained_sum;
             let mut cumulative = 0.;
-            ranked
+            self.ranked
                 .iter()
                 .find(|(_, p)| {
                     cumulative += p;
                     cumulative > target
                 })
-                .unwrap_or_else(|| ranked.last().expect("nonempty distribution"))
+                .unwrap_or_else(|| self.ranked.last().expect("nonempty distribution"))
                 .0
         };
         self.seen[token] = true;

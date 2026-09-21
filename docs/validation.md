@@ -65,10 +65,10 @@ runs, because a cold page cache changes its first-token latency.
 
 | Model | Concurrent requests | Mean first token (ms) | Mean decode tokens/s | Peak RSS (MiB) |
 | --- | ---: | ---: | ---: | ---: |
-| 1.8B 1.25Bit | 1 | 183.0 | 81.36 | 568.8 |
-| 1.8B 1.25Bit | 2 | 296.0 | 54.62 | 597.0 |
-| 1.8B 2Bit | 1 | 336.0 | 5.77 | 694.1 |
-| 1.8B 2Bit | 2 | 535.5 | 3.60 | 715.1 |
+| 1.8B 1.25Bit | 1 | 156.8 | 99.32 | 560.3 |
+| 1.8B 1.25Bit | 2 | 262.4 | 79.25 | 600.5 |
+| 1.8B 2Bit | 1 | 153.5 | 86.86 | 691.5 |
+| 1.8B 2Bit | 2 | 262.1 | 45.08 | 730.2 |
 | 7B Q4_K_M | 1 | 844.0 | 2.96 | 4586.8 |
 | 7B Q4_K_M | 2 | 1526.5 | 1.94 | 4676.1 |
 

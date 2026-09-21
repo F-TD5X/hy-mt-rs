@@ -328,6 +328,23 @@ impl Model {
         tokens: &[u32],
         cancel: &CancellationToken,
     ) -> Result<Vec<f32>> {
+        let mut logits = vec![0.; self.config.vocab_size];
+        self.forward_into(session, tokens, cancel, &mut logits)?;
+        Ok(logits)
+    }
+
+    /// Computes next-token logits directly into the provided output buffer.
+    pub fn forward_into(
+        &self,
+        session: &mut Session,
+        tokens: &[u32],
+        cancel: &CancellationToken,
+        out: &mut [f32],
+    ) -> Result<()> {
+        ensure!(
+            out.len() == self.config.vocab_size,
+            "output buffer length mismatch"
+        );
         ensure!(
             !session.poisoned,
             "session was invalidated by a failed forward"
@@ -501,28 +518,31 @@ impl Model {
                 self.config.rms_epsilon,
             );
             #[cfg(target_arch = "aarch64")]
-            let logits = if sdot_available()
+            if sdot_available()
                 && matches!(
                     self.output.dtype(),
                     DType::STQ1_0 | DType::Q6_K | DType::Q2_0C
-                ) {
+                )
+            {
                 session.q8_hidden.quantize_into(&session.hidden);
-                let mut logits = vec![0.; self.output.shape()[1]];
-                self.output.gemv_q8_fast(&session.q8_hidden, &mut logits);
-                logits
+                self.output.gemv_q8_fast(&session.q8_hidden, out);
             } else {
-                self.output.matmul(&session.hidden, 1)?
-            };
+                let logits = self.output.matmul(&session.hidden, 1)?;
+                out.copy_from_slice(&logits);
+            }
             #[cfg(not(target_arch = "aarch64"))]
-            let logits = self.output.matmul(&session.hidden, 1)?;
+            {
+                let logits = self.output.matmul(&session.hidden, 1)?;
+                out.copy_from_slice(&logits);
+            }
 
             ensure!(
-                logits.iter().all(|x| x.is_finite()),
+                out.iter().all(|x| x.is_finite()),
                 "model produced non-finite logits; check model format and weights"
             );
             session.position += 1;
             session.poisoned = false;
-            return Ok(logits);
+            return Ok(());
         }
 
         let mut hidden = Vec::with_capacity(batch * self.config.hidden);
@@ -589,9 +609,10 @@ impl Model {
             logits.iter().all(|x| x.is_finite()),
             "model produced non-finite logits; check model format and weights"
         );
+        out.copy_from_slice(&logits);
         session.position += batch;
         session.poisoned = false;
-        Ok(logits)
+        Ok(())
     }
 
     pub fn prefill(
@@ -600,16 +621,27 @@ impl Model {
         tokens: &[u32],
         cancel: &CancellationToken,
     ) -> Result<Vec<f32>> {
+        let mut logits = vec![0.; self.config.vocab_size];
+        self.prefill_into(session, tokens, &mut logits, cancel)?;
+        Ok(logits)
+    }
+
+    pub fn prefill_into(
+        &self,
+        session: &mut Session,
+        tokens: &[u32],
+        out: &mut [f32],
+        cancel: &CancellationToken,
+    ) -> Result<()> {
         ensure!(!tokens.is_empty(), "prompt must contain at least one token");
         ensure!(
             tokens.len() <= session.context - session.position,
             "prompt exceeds context limit"
         );
-        let mut logits = Vec::new();
         for chunk in tokens.chunks(PREFILL_CHUNK) {
-            logits = self.forward(session, chunk, cancel)?;
+            self.forward_into(session, chunk, cancel, out)?;
         }
-        Ok(logits)
+        Ok(())
     }
 }
 

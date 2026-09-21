@@ -155,6 +155,7 @@ impl Weight {
 
     /// Multiply [batch,input] activations by [output,input] packed weights.
     /// Larger prefills reuse bounded 32-row float tiles through Rust GEMM.
+    #[allow(clippy::uninit_vec)]
     pub fn matmul(&self, input: &[f32], batch: usize) -> Result<Vec<f32>> {
         ensure!(self.shape().len() == 2, "{} is not a matrix", self.name());
         let (cols, rows) = (self.shape()[0], self.shape()[1]);
@@ -282,7 +283,11 @@ impl Weight {
                 .enumerate()
                 .try_for_each(|(tile, output)| -> Result<()> {
                     let nrows = output.len() / batch;
-                    let mut w = vec![0.; nrows * cols];
+                    let mut w = Vec::with_capacity(nrows * cols);
+                    // SAFETY: decode overwrites all nrows * cols floats before any reads.
+                    unsafe {
+                        w.set_len(nrows * cols);
+                    }
                     let start = tile * tile_rows * row_bytes;
                     decode(
                         self.dtype(),
@@ -290,24 +295,43 @@ impl Weight {
                         &mut w,
                     )?;
                     let w = Tensor::from_vec(w, (nrows, cols), &Device::Cpu)?;
-                    let result = w.matmul(&xs)?.flatten_all()?.to_vec1::<f32>()?;
-                    output.copy_from_slice(&result);
+                    let result = w.matmul(&xs)?;
+                    let (storage, layout) = result.storage_and_layout();
+                    match &*storage {
+                        candle_core::Storage::Cpu(candle_core::CpuStorage::F32(v)) => {
+                            let offset = layout.start_offset();
+                            output.copy_from_slice(&v[offset..offset + output.len()]);
+                        }
+                        _ => {
+                            let res = result.flatten_all()?.to_vec1::<f32>()?;
+                            output.copy_from_slice(&res);
+                        }
+                    }
                     Ok(())
                 })?;
         } else {
+            thread_local! {
+                static SCRATCH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+            }
             transposed
                 .par_chunks_mut(32 * batch)
                 .enumerate()
                 .for_each(|(tile, tile_out)| {
-                    let mut scratch = vec![0f32; cols];
-                    for (row_idx, output) in tile_out.chunks_mut(batch).enumerate() {
-                        let row = tile * 32 + row_idx;
-                        let bytes = &self.bytes()[row * row_bytes..(row + 1) * row_bytes];
-                        decode_unchecked(self.dtype(), bytes, &mut scratch);
-                        for (b, out) in output.iter_mut().enumerate() {
-                            *out = dot(&scratch, &input[b * cols..(b + 1) * cols]);
+                    SCRATCH.with(|cell| {
+                        let mut scratch = cell.borrow_mut();
+                        if scratch.len() < cols {
+                            scratch.resize(cols, 0.0);
                         }
-                    }
+                        let scratch_slice = &mut scratch[..cols];
+                        for (row_idx, output) in tile_out.chunks_mut(batch).enumerate() {
+                            let row = tile * 32 + row_idx;
+                            let bytes = &self.bytes()[row * row_bytes..(row + 1) * row_bytes];
+                            decode_unchecked(self.dtype(), bytes, scratch_slice);
+                            for (b, out) in output.iter_mut().enumerate() {
+                                *out = dot(scratch_slice, &input[b * cols..(b + 1) * cols]);
+                            }
+                        }
+                    });
                 });
         }
         let mut out = vec![0.; batch * rows];
@@ -344,18 +368,60 @@ impl Weight {
         let row_bytes = cols / self.dtype().block_len() * self.dtype().block_bytes();
         let dtype = self.dtype();
         let all_bytes = self.bytes();
-        out.par_chunks_mut(chunk_size)
-            .enumerate()
-            .for_each(|(chunk_idx, chunk)| {
-                let base_row = chunk_idx * chunk_size;
-                let chunk_bytes =
-                    &all_bytes[base_row * row_bytes..(base_row + chunk.len()) * row_bytes];
-                for (val, row) in chunk.iter_mut().zip(chunk_bytes.chunks_exact(row_bytes)) {
-                    // SAFETY: each row is a whole number of 256-weight blocks,
-                    // and `q8` holds one scale and 256 activations per block.
-                    *val = unsafe { row_dot_q8_raw(dtype, row, q8_values, q8_scales) };
-                }
-            });
+        match dtype {
+            DType::STQ1_0 => {
+                out.par_chunks_mut(chunk_size)
+                    .enumerate()
+                    .for_each(|(chunk_idx, chunk)| {
+                        let base_row = chunk_idx * chunk_size;
+                        let chunk_bytes =
+                            &all_bytes[base_row * row_bytes..(base_row + chunk.len()) * row_bytes];
+                        for (val, row) in chunk.iter_mut().zip(chunk_bytes.chunks_exact(row_bytes))
+                        {
+                            *val = unsafe { stq_row_dot_sdot(row, q8_values, q8_scales) };
+                        }
+                    });
+            }
+            DType::Q2_0C => {
+                out.par_chunks_mut(chunk_size)
+                    .enumerate()
+                    .for_each(|(chunk_idx, chunk)| {
+                        let base_row = chunk_idx * chunk_size;
+                        let chunk_bytes =
+                            &all_bytes[base_row * row_bytes..(base_row + chunk.len()) * row_bytes];
+                        for (val, row) in chunk.iter_mut().zip(chunk_bytes.chunks_exact(row_bytes))
+                        {
+                            *val = unsafe { q2c_row_dot_sdot(row, q8_values, q8_scales) };
+                        }
+                    });
+            }
+            DType::Q6_K => {
+                out.par_chunks_mut(chunk_size)
+                    .enumerate()
+                    .for_each(|(chunk_idx, chunk)| {
+                        let base_row = chunk_idx * chunk_size;
+                        let chunk_bytes =
+                            &all_bytes[base_row * row_bytes..(base_row + chunk.len()) * row_bytes];
+                        for (val, row) in chunk.iter_mut().zip(chunk_bytes.chunks_exact(row_bytes))
+                        {
+                            *val = unsafe { q6_row_dot_sdot(row, q8_values, q8_scales) };
+                        }
+                    });
+            }
+            _ => {
+                out.par_chunks_mut(chunk_size)
+                    .enumerate()
+                    .for_each(|(chunk_idx, chunk)| {
+                        let base_row = chunk_idx * chunk_size;
+                        let chunk_bytes =
+                            &all_bytes[base_row * row_bytes..(base_row + chunk.len()) * row_bytes];
+                        for (val, row) in chunk.iter_mut().zip(chunk_bytes.chunks_exact(row_bytes))
+                        {
+                            *val = unsafe { row_dot_q8_raw(dtype, row, q8_values, q8_scales) };
+                        }
+                    });
+            }
+        }
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -369,30 +435,77 @@ impl Weight {
         v_out: &mut [f32],
     ) -> Result<()> {
         let cols = q.shape()[0];
-        let weights = [q, k, v];
-        let outputs = [q_out, k_out, v_out];
-        let mut tasks: Vec<(DType, &[u8], &mut [f32])> = Vec::with_capacity(128);
-        for (weight, output) in weights.into_iter().zip(outputs) {
-            let dtype = weight.dtype();
-            let row_bytes = cols / dtype.block_len() * dtype.block_bytes();
-            let bytes = weight.bytes();
-            let chunk_size = chunk_rows(output.len());
-            for (chunk_index, chunk) in output.chunks_mut(chunk_size).enumerate() {
-                let start = chunk_index * chunk_size;
-                tasks.push((
-                    dtype,
-                    &bytes[start * row_bytes..(start + chunk.len()) * row_bytes],
-                    chunk,
-                ));
-            }
-        }
+        let q_rows = q_out.len();
+        let k_rows = k_out.len();
+        let v_rows = v_out.len();
+        let total_rows = q_rows + k_rows + v_rows;
+        let chunk_size = chunk_rows(total_rows);
+
+        let q_dtype = q.dtype();
+        let k_dtype = k.dtype();
+        let v_dtype = v.dtype();
+        let q_row_bytes = cols / q_dtype.block_len() * q_dtype.block_bytes();
+        let k_row_bytes = cols / k_dtype.block_len() * k_dtype.block_bytes();
+        let v_row_bytes = cols / v_dtype.block_len() * v_dtype.block_bytes();
+        let q_bytes = q.bytes();
+        let k_bytes = k.bytes();
+        let v_bytes = v.bytes();
         let q8_vals = q8.values();
         let q8_scs = q8.scales();
-        tasks.par_iter_mut().for_each(|(dtype, bytes, output)| {
-            let row_bytes = cols / dtype.block_len() * dtype.block_bytes();
-            for (value, row) in output.iter_mut().zip(bytes.chunks_exact(row_bytes)) {
-                // SAFETY: whole rows against whole activation groups.
-                *value = unsafe { row_dot_q8_raw(*dtype, row, q8_vals, q8_scs) };
+
+        let q_ptr = q_out.as_mut_ptr() as usize;
+        let k_ptr = k_out.as_mut_ptr() as usize;
+        let v_ptr = v_out.as_mut_ptr() as usize;
+
+        let num_chunks = total_rows.div_ceil(chunk_size);
+        (0..num_chunks).into_par_iter().for_each(|chunk_idx| {
+            let start = chunk_idx * chunk_size;
+            let end = (start + chunk_size).min(total_rows);
+            for r in start..end {
+                let val = if r < q_rows {
+                    let row = &q_bytes[r * q_row_bytes..(r + 1) * q_row_bytes];
+                    unsafe {
+                        match q_dtype {
+                            DType::STQ1_0 => stq_row_dot_sdot(row, q8_vals, q8_scs),
+                            DType::Q2_0C => q2c_row_dot_sdot(row, q8_vals, q8_scs),
+                            DType::Q6_K => q6_row_dot_sdot(row, q8_vals, q8_scs),
+                            _ => row_dot_q8_raw(q_dtype, row, q8_vals, q8_scs),
+                        }
+                    }
+                } else if r < q_rows + k_rows {
+                    let kr = r - q_rows;
+                    let row = &k_bytes[kr * k_row_bytes..(kr + 1) * k_row_bytes];
+                    unsafe {
+                        match k_dtype {
+                            DType::STQ1_0 => stq_row_dot_sdot(row, q8_vals, q8_scs),
+                            DType::Q2_0C => q2c_row_dot_sdot(row, q8_vals, q8_scs),
+                            DType::Q6_K => q6_row_dot_sdot(row, q8_vals, q8_scs),
+                            _ => row_dot_q8_raw(k_dtype, row, q8_vals, q8_scs),
+                        }
+                    }
+                } else {
+                    let vr = r - q_rows - k_rows;
+                    let row = &v_bytes[vr * v_row_bytes..(vr + 1) * v_row_bytes];
+                    unsafe {
+                        match v_dtype {
+                            DType::STQ1_0 => stq_row_dot_sdot(row, q8_vals, q8_scs),
+                            DType::Q2_0C => q2c_row_dot_sdot(row, q8_vals, q8_scs),
+                            DType::Q6_K => q6_row_dot_sdot(row, q8_vals, q8_scs),
+                            _ => row_dot_q8_raw(v_dtype, row, q8_vals, q8_scs),
+                        }
+                    }
+                };
+
+                // SAFETY: each r in 0..total_rows is unique, writing to disjoint indices in q_out, k_out, or v_out.
+                unsafe {
+                    if r < q_rows {
+                        *(q_ptr as *mut f32).add(r) = val;
+                    } else if r < q_rows + k_rows {
+                        *(k_ptr as *mut f32).add(r - q_rows) = val;
+                    } else {
+                        *(v_ptr as *mut f32).add(r - q_rows - k_rows) = val;
+                    }
+                }
             }
         });
         Ok(())
@@ -408,29 +521,109 @@ impl Weight {
         let up_bytes = up.bytes();
         let q8_vals = q8.values();
         let q8_scs = q8.scales();
-        out.par_chunks_mut(chunk_size)
-            .enumerate()
-            .for_each(|(chunk_idx, chunk)| {
-                let base_row = chunk_idx * chunk_size;
-                let self_chunk =
-                    &self_bytes[base_row * row_bytes..(base_row + chunk.len()) * row_bytes];
-                let up_chunk =
-                    &up_bytes[base_row * row_bytes..(base_row + chunk.len()) * row_bytes];
-                for ((val, g_b), u_b) in chunk
-                    .iter_mut()
-                    .zip(self_chunk.chunks_exact(row_bytes))
-                    .zip(up_chunk.chunks_exact(row_bytes))
-                {
-                    let (g, u) = unsafe {
-                        (
-                            row_dot_q8_raw(dtype, g_b, q8_vals, q8_scs),
-                            row_dot_q8_raw(dtype, u_b, q8_vals, q8_scs),
-                        )
-                    };
-                    let silu = g / (1.0 + (-g).exp());
-                    *val = silu * u;
-                }
-            });
+
+        match dtype {
+            DType::STQ1_0 => {
+                out.par_chunks_mut(chunk_size)
+                    .enumerate()
+                    .for_each(|(chunk_idx, chunk)| {
+                        let base_row = chunk_idx * chunk_size;
+                        let self_chunk =
+                            &self_bytes[base_row * row_bytes..(base_row + chunk.len()) * row_bytes];
+                        let up_chunk =
+                            &up_bytes[base_row * row_bytes..(base_row + chunk.len()) * row_bytes];
+                        for ((val, g_b), u_b) in chunk
+                            .iter_mut()
+                            .zip(self_chunk.chunks_exact(row_bytes))
+                            .zip(up_chunk.chunks_exact(row_bytes))
+                        {
+                            let (g, u) = unsafe {
+                                (
+                                    stq_row_dot_sdot(g_b, q8_vals, q8_scs),
+                                    stq_row_dot_sdot(u_b, q8_vals, q8_scs),
+                                )
+                            };
+                            let silu = g / (1.0 + (-g).exp());
+                            *val = silu * u;
+                        }
+                    });
+            }
+            DType::Q2_0C => {
+                out.par_chunks_mut(chunk_size)
+                    .enumerate()
+                    .for_each(|(chunk_idx, chunk)| {
+                        let base_row = chunk_idx * chunk_size;
+                        let self_chunk =
+                            &self_bytes[base_row * row_bytes..(base_row + chunk.len()) * row_bytes];
+                        let up_chunk =
+                            &up_bytes[base_row * row_bytes..(base_row + chunk.len()) * row_bytes];
+                        for ((val, g_b), u_b) in chunk
+                            .iter_mut()
+                            .zip(self_chunk.chunks_exact(row_bytes))
+                            .zip(up_chunk.chunks_exact(row_bytes))
+                        {
+                            let (g, u) = unsafe {
+                                (
+                                    q2c_row_dot_sdot(g_b, q8_vals, q8_scs),
+                                    q2c_row_dot_sdot(u_b, q8_vals, q8_scs),
+                                )
+                            };
+                            let silu = g / (1.0 + (-g).exp());
+                            *val = silu * u;
+                        }
+                    });
+            }
+            DType::Q6_K => {
+                out.par_chunks_mut(chunk_size)
+                    .enumerate()
+                    .for_each(|(chunk_idx, chunk)| {
+                        let base_row = chunk_idx * chunk_size;
+                        let self_chunk =
+                            &self_bytes[base_row * row_bytes..(base_row + chunk.len()) * row_bytes];
+                        let up_chunk =
+                            &up_bytes[base_row * row_bytes..(base_row + chunk.len()) * row_bytes];
+                        for ((val, g_b), u_b) in chunk
+                            .iter_mut()
+                            .zip(self_chunk.chunks_exact(row_bytes))
+                            .zip(up_chunk.chunks_exact(row_bytes))
+                        {
+                            let (g, u) = unsafe {
+                                (
+                                    q6_row_dot_sdot(g_b, q8_vals, q8_scs),
+                                    q6_row_dot_sdot(u_b, q8_vals, q8_scs),
+                                )
+                            };
+                            let silu = g / (1.0 + (-g).exp());
+                            *val = silu * u;
+                        }
+                    });
+            }
+            _ => {
+                out.par_chunks_mut(chunk_size)
+                    .enumerate()
+                    .for_each(|(chunk_idx, chunk)| {
+                        let base_row = chunk_idx * chunk_size;
+                        let self_chunk =
+                            &self_bytes[base_row * row_bytes..(base_row + chunk.len()) * row_bytes];
+                        let up_chunk =
+                            &up_bytes[base_row * row_bytes..(base_row + chunk.len()) * row_bytes];
+                        for ((val, g_b), u_b) in chunk
+                            .iter_mut()
+                            .zip(self_chunk.chunks_exact(row_bytes))
+                            .zip(up_chunk.chunks_exact(row_bytes))
+                        {
+                            let (g, u) = unsafe {
+                                (
+                                    row_dot_q8_raw(dtype, g_b, q8_vals, q8_scs),
+                                    row_dot_q8_raw(dtype, u_b, q8_vals, q8_scs),
+                                )
+                            };
+                            let silu = g / (1.0 + (-g).exp());
+                            *val = silu * u;
+                        }
+                    });
+            }
+        }
     }
 
     /// Batch-1 query, key and value projections of one attention layer.
@@ -789,7 +982,7 @@ pub(crate) fn sdot_available() -> bool {
 /// integer kernels run, so many small tasks balance better than a few large
 /// ones; 32 rows is the useful floor at roughly 2 microseconds of work.
 fn chunk_rows(rows: usize) -> usize {
-    let target_chunks = (rayon::current_num_threads() * 32).max(1);
+    let target_chunks = (rayon::current_num_threads() * 16).max(1);
     (rows / target_chunks).clamp(32, 2048)
 }
 
@@ -1254,36 +1447,44 @@ unsafe fn stq_row_dot_sdot(row_bytes: &[u8], activations: &[i8], scales: &[f32])
             let mut acc1 = vdupq_n_s32(0);
             let mut acc2 = vdupq_n_s32(0);
             let mut acc3 = vdupq_n_s32(0);
+            let mut acc4 = vdupq_n_s32(0);
+            let mut acc5 = vdupq_n_s32(0);
+            let mut acc6 = vdupq_n_s32(0);
+            let mut acc7 = vdupq_n_s32(0);
 
             let d0 = stq_digit_lanes(block.as_ptr(), 0, &tables, sign_shifts);
             let xp0 = x_ptr;
             acc0 = sdot(acc0, vld1q_s8(xp0), d0[0]);
-            acc0 = sdot(acc0, vld1q_s8(xp0.add(16)), d0[1]);
-            acc0 = sdot(acc0, vld1q_s8(xp0.add(32)), d0[2]);
-            acc0 = sdot(acc0, vld1q_s8(xp0.add(48)), d0[3]);
+            acc1 = sdot(acc1, vld1q_s8(xp0.add(16)), d0[1]);
+            acc2 = sdot(acc2, vld1q_s8(xp0.add(32)), d0[2]);
+            acc3 = sdot(acc3, vld1q_s8(xp0.add(48)), d0[3]);
 
             let d1 = stq_digit_lanes(block.as_ptr(), 1, &tables, sign_shifts);
             let xp1 = x_ptr.add(64);
-            acc1 = sdot(acc1, vld1q_s8(xp1), d1[0]);
-            acc1 = sdot(acc1, vld1q_s8(xp1.add(16)), d1[1]);
-            acc1 = sdot(acc1, vld1q_s8(xp1.add(32)), d1[2]);
-            acc1 = sdot(acc1, vld1q_s8(xp1.add(48)), d1[3]);
+            acc4 = sdot(acc4, vld1q_s8(xp1), d1[0]);
+            acc5 = sdot(acc5, vld1q_s8(xp1.add(16)), d1[1]);
+            acc6 = sdot(acc6, vld1q_s8(xp1.add(32)), d1[2]);
+            acc7 = sdot(acc7, vld1q_s8(xp1.add(48)), d1[3]);
 
             let d2 = stq_digit_lanes(block.as_ptr(), 2, &tables, sign_shifts);
             let xp2 = x_ptr.add(128);
-            acc2 = sdot(acc2, vld1q_s8(xp2), d2[0]);
-            acc2 = sdot(acc2, vld1q_s8(xp2.add(16)), d2[1]);
+            acc0 = sdot(acc0, vld1q_s8(xp2), d2[0]);
+            acc1 = sdot(acc1, vld1q_s8(xp2.add(16)), d2[1]);
             acc2 = sdot(acc2, vld1q_s8(xp2.add(32)), d2[2]);
-            acc2 = sdot(acc2, vld1q_s8(xp2.add(48)), d2[3]);
+            acc3 = sdot(acc3, vld1q_s8(xp2.add(48)), d2[3]);
 
             let d3 = stq_digit_lanes(block.as_ptr(), 3, &tables, sign_shifts);
             let xp3 = x_ptr.add(192);
-            acc3 = sdot(acc3, vld1q_s8(xp3), d3[0]);
-            acc3 = sdot(acc3, vld1q_s8(xp3.add(16)), d3[1]);
-            acc3 = sdot(acc3, vld1q_s8(xp3.add(32)), d3[2]);
-            acc3 = sdot(acc3, vld1q_s8(xp3.add(48)), d3[3]);
+            acc4 = sdot(acc4, vld1q_s8(xp3), d3[0]);
+            acc5 = sdot(acc5, vld1q_s8(xp3.add(16)), d3[1]);
+            acc6 = sdot(acc6, vld1q_s8(xp3.add(32)), d3[2]);
+            acc7 = sdot(acc7, vld1q_s8(xp3.add(48)), d3[3]);
 
-            let acc = vaddq_s32(vaddq_s32(acc0, acc1), vaddq_s32(acc2, acc3));
+            let acc01 = vaddq_s32(acc0, acc1);
+            let acc23 = vaddq_s32(acc2, acc3);
+            let acc45 = vaddq_s32(acc4, acc5);
+            let acc67 = vaddq_s32(acc6, acc7);
+            let acc = vaddq_s32(vaddq_s32(acc01, acc23), vaddq_s32(acc45, acc67));
             row_acc = vfmaq_n_f32(row_acc, vcvtq_f32_s32(acc), block_scale);
             x_ptr = x_ptr.add(256);
         }
@@ -1552,15 +1753,27 @@ unsafe fn q6_row_dot_neon(row_bytes: &[u8], x: &[f32]) -> f32 {
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn q2c_unpack_64(raw: std::arch::aarch64::uint8x16_t) -> [std::arch::aarch64::int8x16_t; 4] {
+    unsafe {
+        let mask = std::arch::aarch64::vdupq_n_u8(3);
+        let three = std::arch::aarch64::vdupq_n_s8(3);
+        q2c_unpack_64_with_masks(raw, mask, three)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn q2c_unpack_64_with_masks(
+    raw: std::arch::aarch64::uint8x16_t,
+    mask: std::arch::aarch64::uint8x16_t,
+    three: std::arch::aarch64::int8x16_t,
+) -> [std::arch::aarch64::int8x16_t; 4] {
     use std::arch::aarch64::*;
     unsafe {
-        let mask = vdupq_n_u8(3);
         let p0 = vandq_u8(raw, mask);
         let p1 = vandq_u8(vshrq_n_u8(raw, 2), mask);
         let p2 = vandq_u8(vshrq_n_u8(raw, 4), mask);
         let p3 = vshrq_n_u8(raw, 6);
 
-        let three = vdupq_n_s8(3);
         let p0_val = vsubq_s8(vshlq_n_s8(vreinterpretq_s8_u8(p0), 1), three);
         let p1_val = vsubq_s8(vshlq_n_s8(vreinterpretq_s8_u8(p1), 1), three);
         let p2_val = vsubq_s8(vshlq_n_s8(vreinterpretq_s8_u8(p2), 1), three);
@@ -1599,6 +1812,8 @@ unsafe fn q2c_unpack_64(raw: std::arch::aarch64::uint8x16_t) -> [std::arch::aarc
 unsafe fn q2c_row_dot_sdot(row_bytes: &[u8], activations: &[i8], scales: &[f32]) -> f32 {
     use std::arch::aarch64::*;
     unsafe {
+        let mask3 = vdupq_n_u8(3);
+        let three = vdupq_n_s8(3);
         let mut row_acc = vdupq_n_f32(0.);
         let mut b_ptr = row_bytes.as_ptr();
         let mut x_ptr = activations.as_ptr();
@@ -1614,36 +1829,103 @@ unsafe fn q2c_row_dot_sdot(row_bytes: &[u8], activations: &[i8], scales: &[f32])
             let mut acc1 = vdupq_n_s32(0);
             let mut acc2 = vdupq_n_s32(0);
             let mut acc3 = vdupq_n_s32(0);
-
-            for chunk in 0..4 {
-                let raw = vld1q_u8(payload.add(chunk * 16));
-                let [w0, w1, w2, w3] = q2c_unpack_64(raw);
-                let xp = x_ptr.add(chunk * 64);
-                acc0 = sdot(acc0, vld1q_s8(xp), w0);
-                acc1 = sdot(acc1, vld1q_s8(xp.add(16)), w1);
-                acc2 = sdot(acc2, vld1q_s8(xp.add(32)), w2);
-                acc3 = sdot(acc3, vld1q_s8(xp.add(48)), w3);
-            }
-            let grp0_sum = vaddq_s32(vaddq_s32(acc0, acc1), vaddq_s32(acc2, acc3));
-            row_acc = vfmaq_n_f32(row_acc, vcvtq_f32_s32(grp0_sum), scale0);
-
-            // Group 1: second 256 weights (chunks 4..8)
-            let scale1 = d * scales[block_idx * 2 + 1];
             let mut acc4 = vdupq_n_s32(0);
             let mut acc5 = vdupq_n_s32(0);
             let mut acc6 = vdupq_n_s32(0);
             let mut acc7 = vdupq_n_s32(0);
 
-            for chunk in 0..4 {
-                let raw = vld1q_u8(payload.add(64 + chunk * 16));
-                let [w0, w1, w2, w3] = q2c_unpack_64(raw);
-                let xp = x_ptr.add(256 + chunk * 64);
-                acc4 = sdot(acc4, vld1q_s8(xp), w0);
-                acc5 = sdot(acc5, vld1q_s8(xp.add(16)), w1);
-                acc6 = sdot(acc6, vld1q_s8(xp.add(32)), w2);
-                acc7 = sdot(acc7, vld1q_s8(xp.add(48)), w3);
-            }
-            let grp1_sum = vaddq_s32(vaddq_s32(acc4, acc5), vaddq_s32(acc6, acc7));
+            // Chunk 0
+            let raw0 = vld1q_u8(payload);
+            let [w0, w1, w2, w3] = q2c_unpack_64_with_masks(raw0, mask3, three);
+            acc0 = sdot(acc0, vld1q_s8(x_ptr), w0);
+            acc1 = sdot(acc1, vld1q_s8(x_ptr.add(16)), w1);
+            acc2 = sdot(acc2, vld1q_s8(x_ptr.add(32)), w2);
+            acc3 = sdot(acc3, vld1q_s8(x_ptr.add(48)), w3);
+
+            // Chunk 1
+            let raw1 = vld1q_u8(payload.add(16));
+            let [w4, w5, w6, w7] = q2c_unpack_64_with_masks(raw1, mask3, three);
+            let xp1 = x_ptr.add(64);
+            acc4 = sdot(acc4, vld1q_s8(xp1), w4);
+            acc5 = sdot(acc5, vld1q_s8(xp1.add(16)), w5);
+            acc6 = sdot(acc6, vld1q_s8(xp1.add(32)), w6);
+            acc7 = sdot(acc7, vld1q_s8(xp1.add(48)), w7);
+
+            // Chunk 2
+            let raw2 = vld1q_u8(payload.add(32));
+            let [w8, w9, w10, w11] = q2c_unpack_64_with_masks(raw2, mask3, three);
+            let xp2 = x_ptr.add(128);
+            acc0 = sdot(acc0, vld1q_s8(xp2), w8);
+            acc1 = sdot(acc1, vld1q_s8(xp2.add(16)), w9);
+            acc2 = sdot(acc2, vld1q_s8(xp2.add(32)), w10);
+            acc3 = sdot(acc3, vld1q_s8(xp2.add(48)), w11);
+
+            // Chunk 3
+            let raw3 = vld1q_u8(payload.add(48));
+            let [w12, w13, w14, w15] = q2c_unpack_64_with_masks(raw3, mask3, three);
+            let xp3 = x_ptr.add(192);
+            acc4 = sdot(acc4, vld1q_s8(xp3), w12);
+            acc5 = sdot(acc5, vld1q_s8(xp3.add(16)), w13);
+            acc6 = sdot(acc6, vld1q_s8(xp3.add(32)), w14);
+            acc7 = sdot(acc7, vld1q_s8(xp3.add(48)), w15);
+
+            let grp0_sum = vaddq_s32(
+                vaddq_s32(vaddq_s32(acc0, acc1), vaddq_s32(acc2, acc3)),
+                vaddq_s32(vaddq_s32(acc4, acc5), vaddq_s32(acc6, acc7)),
+            );
+            row_acc = vfmaq_n_f32(row_acc, vcvtq_f32_s32(grp0_sum), scale0);
+
+            // Group 1: second 256 weights (chunks 4..8)
+            let scale1 = d * scales[block_idx * 2 + 1];
+            let mut acc8 = vdupq_n_s32(0);
+            let mut acc9 = vdupq_n_s32(0);
+            let mut acc10 = vdupq_n_s32(0);
+            let mut acc11 = vdupq_n_s32(0);
+            let mut acc12 = vdupq_n_s32(0);
+            let mut acc13 = vdupq_n_s32(0);
+            let mut acc14 = vdupq_n_s32(0);
+            let mut acc15 = vdupq_n_s32(0);
+
+            // Chunk 4
+            let raw4 = vld1q_u8(payload.add(64));
+            let [w16, w17, w18, w19] = q2c_unpack_64_with_masks(raw4, mask3, three);
+            let xp4 = x_ptr.add(256);
+            acc8 = sdot(acc8, vld1q_s8(xp4), w16);
+            acc9 = sdot(acc9, vld1q_s8(xp4.add(16)), w17);
+            acc10 = sdot(acc10, vld1q_s8(xp4.add(32)), w18);
+            acc11 = sdot(acc11, vld1q_s8(xp4.add(48)), w19);
+
+            // Chunk 5
+            let raw5 = vld1q_u8(payload.add(80));
+            let [w20, w21, w22, w23] = q2c_unpack_64_with_masks(raw5, mask3, three);
+            let xp5 = x_ptr.add(320);
+            acc12 = sdot(acc12, vld1q_s8(xp5), w20);
+            acc13 = sdot(acc13, vld1q_s8(xp5.add(16)), w21);
+            acc14 = sdot(acc14, vld1q_s8(xp5.add(32)), w22);
+            acc15 = sdot(acc15, vld1q_s8(xp5.add(48)), w23);
+
+            // Chunk 6
+            let raw6 = vld1q_u8(payload.add(96));
+            let [w24, w25, w26, w27] = q2c_unpack_64_with_masks(raw6, mask3, three);
+            let xp6 = x_ptr.add(384);
+            acc8 = sdot(acc8, vld1q_s8(xp6), w24);
+            acc9 = sdot(acc9, vld1q_s8(xp6.add(16)), w25);
+            acc10 = sdot(acc10, vld1q_s8(xp6.add(32)), w26);
+            acc11 = sdot(acc11, vld1q_s8(xp6.add(48)), w27);
+
+            // Chunk 7
+            let raw7 = vld1q_u8(payload.add(112));
+            let [w28, w29, w30, w31] = q2c_unpack_64_with_masks(raw7, mask3, three);
+            let xp7 = x_ptr.add(448);
+            acc12 = sdot(acc12, vld1q_s8(xp7), w28);
+            acc13 = sdot(acc13, vld1q_s8(xp7.add(16)), w29);
+            acc14 = sdot(acc14, vld1q_s8(xp7.add(32)), w30);
+            acc15 = sdot(acc15, vld1q_s8(xp7.add(48)), w31);
+
+            let grp1_sum = vaddq_s32(
+                vaddq_s32(vaddq_s32(acc8, acc9), vaddq_s32(acc10, acc11)),
+                vaddq_s32(vaddq_s32(acc12, acc13), vaddq_s32(acc14, acc15)),
+            );
             row_acc = vfmaq_n_f32(row_acc, vcvtq_f32_s32(grp1_sum), scale1);
 
             b_ptr = b_ptr.add(130);
