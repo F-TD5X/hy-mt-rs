@@ -669,9 +669,9 @@ fn attention(q: &[f32], cache: &KvCache, config: &Config, past: usize) -> Vec<f3
                 heap_scores = vec![0f32; visible];
                 &mut heap_scores[..]
             };
-            for pos in 0..visible {
+            for (pos, score) in scores.iter_mut().enumerate() {
                 let offset = pos * kv_width + kv_head * dim;
-                scores[pos] = dot(query, &cache.keys[offset..offset + dim]) * scale;
+                *score = dot(query, &cache.keys[offset..offset + dim]) * scale;
             }
             let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let mut sum = 0.;
@@ -709,7 +709,10 @@ fn attention(q: &[f32], cache: &KvCache, config: &Config, past: usize) -> Vec<f3
                             vp = vp.add(16);
                         }
                     }
-                    for (out_val, &val) in output[chunks * 16..].iter_mut().zip(&val_slice[chunks * 16..]) {
+                    for (out_val, &val) in output[chunks * 16..]
+                        .iter_mut()
+                        .zip(&val_slice[chunks * 16..])
+                    {
                         *out_val += p * val;
                     }
                     continue;
@@ -752,7 +755,6 @@ fn add(dst: &mut [f32], src: &[f32]) {
         for (x, y) in dst[chunks * 16..].iter_mut().zip(&src[chunks * 16..]) {
             *x += y;
         }
-        return;
     }
     #[cfg(not(target_arch = "aarch64"))]
     for (x, y) in dst.iter_mut().zip(src) {

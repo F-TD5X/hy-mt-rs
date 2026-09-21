@@ -156,8 +156,11 @@ impl Weight {
                         .enumerate()
                         .for_each(|(chunk_idx, chunk)| {
                             let base_row = chunk_idx * chunk_size;
-                            let chunk_bytes = &all_bytes[base_row * row_bytes..(base_row + chunk.len()) * row_bytes];
-                            for (val, row_b) in chunk.iter_mut().zip(chunk_bytes.chunks_exact(row_bytes)) {
+                            let chunk_bytes = &all_bytes
+                                [base_row * row_bytes..(base_row + chunk.len()) * row_bytes];
+                            for (val, row_b) in
+                                chunk.iter_mut().zip(chunk_bytes.chunks_exact(row_bytes))
+                            {
                                 *val = stq_row_dot(row_b, input);
                             }
                         });
@@ -168,8 +171,11 @@ impl Weight {
                         .enumerate()
                         .for_each(|(chunk_idx, chunk)| {
                             let base_row = chunk_idx * chunk_size;
-                            let chunk_bytes = &all_bytes[base_row * row_bytes..(base_row + chunk.len()) * row_bytes];
-                            for (val, row_b) in chunk.iter_mut().zip(chunk_bytes.chunks_exact(row_bytes)) {
+                            let chunk_bytes = &all_bytes
+                                [base_row * row_bytes..(base_row + chunk.len()) * row_bytes];
+                            for (val, row_b) in
+                                chunk.iter_mut().zip(chunk_bytes.chunks_exact(row_bytes))
+                            {
                                 *val = q6_row_dot(row_b, input);
                             }
                         });
@@ -200,10 +206,18 @@ impl Weight {
                                 let row = base_row + i;
                                 let bytes = &self.bytes()[row * row_bytes..(row + 1) * row_bytes];
                                 let mut sum = 0.0;
-                                for (block, b_bytes) in bytes.chunks_exact(block_bytes).enumerate() {
+                                for (block, b_bytes) in bytes.chunks_exact(block_bytes).enumerate()
+                                {
                                     let start = block * block_len;
-                                    decode_unchecked(self.dtype(), b_bytes, &mut scratch[..block_len]);
-                                    sum += dot(&scratch[..block_len], &input[start..start + block_len]);
+                                    decode_unchecked(
+                                        self.dtype(),
+                                        b_bytes,
+                                        &mut scratch[..block_len],
+                                    );
+                                    sum += dot(
+                                        &scratch[..block_len],
+                                        &input[start..start + block_len],
+                                    );
                                 }
                                 *val = sum;
                             }
@@ -219,7 +233,9 @@ impl Weight {
             let xs = Tensor::from_slice(input, (batch, cols), &Device::Cpu)?
                 .t()?
                 .contiguous()?;
-            let tile_rows = 128;
+            // 64 rows fits the decoded STQ tile and its GEMM working set in cache
+            // on the CPU path; wider tiles reduce long-prefill throughput.
+            let tile_rows = 64;
             transposed
                 .par_chunks_mut(tile_rows * batch)
                 .enumerate()
@@ -265,10 +281,7 @@ impl Weight {
     /// Fused gate and up projection with SiLU activation: `silu(gate(x)) * up(x)`.
     pub fn matmul_gate_up_silu(&self, up: &Weight, input: &[f32]) -> Result<Vec<f32>> {
         let (cols, rows) = (self.shape()[0], self.shape()[1]);
-        ensure!(
-            up.shape() == self.shape(),
-            "gate and up shape mismatch"
-        );
+        ensure!(up.shape() == self.shape(), "gate and up shape mismatch");
         ensure!(
             input.len() == cols,
             "invalid activation shape for gate_up_silu"
@@ -287,9 +300,12 @@ impl Weight {
                     .enumerate()
                     .for_each(|(chunk_idx, chunk)| {
                         let base_row = chunk_idx * chunk_size;
-                        let self_chunk = &self_bytes[base_row * row_bytes..(base_row + chunk.len()) * row_bytes];
-                        let up_chunk = &up_bytes[base_row * row_bytes..(base_row + chunk.len()) * row_bytes];
-                        for ((val, g_b), u_b) in chunk.iter_mut()
+                        let self_chunk =
+                            &self_bytes[base_row * row_bytes..(base_row + chunk.len()) * row_bytes];
+                        let up_chunk =
+                            &up_bytes[base_row * row_bytes..(base_row + chunk.len()) * row_bytes];
+                        for ((val, g_b), u_b) in chunk
+                            .iter_mut()
                             .zip(self_chunk.chunks_exact(row_bytes))
                             .zip(up_chunk.chunks_exact(row_bytes))
                         {
@@ -372,7 +388,6 @@ fn stq_digits(bytes: &[u8], scale: f32, out: &mut [f32]) {
     {
         // SAFETY: out has len 256, bytes has len at least 42.
         unsafe { stq_digits_neon(bytes, scale, out) };
-        return;
     }
     #[cfg(not(target_arch = "aarch64"))]
     stq_digits_scalar(bytes, scale, out);
@@ -434,37 +449,85 @@ unsafe fn stq_digits_neon(bytes: &[u8], scale: f32, out: &mut [f32]) {
             let lo8_0 = vmovl_s8(vget_low_s8(t8_0));
             let hi8_0 = vmovl_high_s8(t8_0);
             let dst0 = out_ptr.add(c * 64);
-            vst1q_f32(dst0, vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_0))), scale_vec));
-            vst1q_f32(dst0.add(4), vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(lo8_0)), scale_vec));
-            vst1q_f32(dst0.add(8), vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_0))), scale_vec));
-            vst1q_f32(dst0.add(12), vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(hi8_0)), scale_vec));
+            vst1q_f32(
+                dst0,
+                vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_0))), scale_vec),
+            );
+            vst1q_f32(
+                dst0.add(4),
+                vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(lo8_0)), scale_vec),
+            );
+            vst1q_f32(
+                dst0.add(8),
+                vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_0))), scale_vec),
+            );
+            vst1q_f32(
+                dst0.add(12),
+                vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(hi8_0)), scale_vec),
+            );
 
             let t8_1 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(vshrq_n_u8(packed, 2), mask3), one));
             let lo8_1 = vmovl_s8(vget_low_s8(t8_1));
             let hi8_1 = vmovl_high_s8(t8_1);
             let dst1 = dst0.add(16);
-            vst1q_f32(dst1, vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_1))), scale_vec));
-            vst1q_f32(dst1.add(4), vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(lo8_1)), scale_vec));
-            vst1q_f32(dst1.add(8), vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_1))), scale_vec));
-            vst1q_f32(dst1.add(12), vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(hi8_1)), scale_vec));
+            vst1q_f32(
+                dst1,
+                vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_1))), scale_vec),
+            );
+            vst1q_f32(
+                dst1.add(4),
+                vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(lo8_1)), scale_vec),
+            );
+            vst1q_f32(
+                dst1.add(8),
+                vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_1))), scale_vec),
+            );
+            vst1q_f32(
+                dst1.add(12),
+                vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(hi8_1)), scale_vec),
+            );
 
             let t8_2 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(vshrq_n_u8(packed, 4), mask3), one));
             let lo8_2 = vmovl_s8(vget_low_s8(t8_2));
             let hi8_2 = vmovl_high_s8(t8_2);
             let dst2 = dst0.add(32);
-            vst1q_f32(dst2, vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_2))), scale_vec));
-            vst1q_f32(dst2.add(4), vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(lo8_2)), scale_vec));
-            vst1q_f32(dst2.add(8), vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_2))), scale_vec));
-            vst1q_f32(dst2.add(12), vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(hi8_2)), scale_vec));
+            vst1q_f32(
+                dst2,
+                vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_2))), scale_vec),
+            );
+            vst1q_f32(
+                dst2.add(4),
+                vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(lo8_2)), scale_vec),
+            );
+            vst1q_f32(
+                dst2.add(8),
+                vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_2))), scale_vec),
+            );
+            vst1q_f32(
+                dst2.add(12),
+                vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(hi8_2)), scale_vec),
+            );
 
             let t8_3 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(vshrq_n_u8(packed, 6), mask3), one));
             let lo8_3 = vmovl_s8(vget_low_s8(t8_3));
             let hi8_3 = vmovl_high_s8(t8_3);
             let dst3 = dst0.add(48);
-            vst1q_f32(dst3, vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_3))), scale_vec));
-            vst1q_f32(dst3.add(4), vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(lo8_3)), scale_vec));
-            vst1q_f32(dst3.add(8), vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_3))), scale_vec));
-            vst1q_f32(dst3.add(12), vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(hi8_3)), scale_vec));
+            vst1q_f32(
+                dst3,
+                vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_3))), scale_vec),
+            );
+            vst1q_f32(
+                dst3.add(4),
+                vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(lo8_3)), scale_vec),
+            );
+            vst1q_f32(
+                dst3.add(8),
+                vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_3))), scale_vec),
+            );
+            vst1q_f32(
+                dst3.add(12),
+                vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(hi8_3)), scale_vec),
+            );
         }
     }
 }
@@ -490,8 +553,6 @@ pub(crate) fn stq_dot(bytes: &[u8], x: &[f32]) -> f32 {
         dot(&digits, x)
     }
 }
-
-
 
 #[inline(always)]
 pub(crate) fn stq_row_dot(row_bytes: &[u8], x: &[f32]) -> f32 {
@@ -555,37 +616,104 @@ unsafe fn stq_row_dot_neon(row_bytes: &[u8], x: &[f32]) -> f32 {
                 let lo8_0 = vmovl_s8(vget_low_s8(t8_0));
                 let hi8_0 = vmovl_high_s8(t8_0);
                 let xs0 = x_ptr.add(c * 64);
-                a0 = vfmaq_f32(a0, vld1q_f32(xs0), vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_0))));
-                a1 = vfmaq_f32(a1, vld1q_f32(xs0.add(4)), vcvtq_f32_s32(vmovl_high_s16(lo8_0)));
-                a2 = vfmaq_f32(a2, vld1q_f32(xs0.add(8)), vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_0))));
-                a3 = vfmaq_f32(a3, vld1q_f32(xs0.add(12)), vcvtq_f32_s32(vmovl_high_s16(hi8_0)));
+                a0 = vfmaq_f32(
+                    a0,
+                    vld1q_f32(xs0),
+                    vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_0))),
+                );
+                a1 = vfmaq_f32(
+                    a1,
+                    vld1q_f32(xs0.add(4)),
+                    vcvtq_f32_s32(vmovl_high_s16(lo8_0)),
+                );
+                a2 = vfmaq_f32(
+                    a2,
+                    vld1q_f32(xs0.add(8)),
+                    vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_0))),
+                );
+                a3 = vfmaq_f32(
+                    a3,
+                    vld1q_f32(xs0.add(12)),
+                    vcvtq_f32_s32(vmovl_high_s16(hi8_0)),
+                );
 
-                let t8_1 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(vshrq_n_u8(packed, 2), mask3), one));
+                let t8_1 =
+                    vreinterpretq_s8_u8(vsubq_u8(vandq_u8(vshrq_n_u8(packed, 2), mask3), one));
                 let lo8_1 = vmovl_s8(vget_low_s8(t8_1));
                 let hi8_1 = vmovl_high_s8(t8_1);
                 let xs1 = xs0.add(16);
-                a0 = vfmaq_f32(a0, vld1q_f32(xs1), vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_1))));
-                a1 = vfmaq_f32(a1, vld1q_f32(xs1.add(4)), vcvtq_f32_s32(vmovl_high_s16(lo8_1)));
-                a2 = vfmaq_f32(a2, vld1q_f32(xs1.add(8)), vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_1))));
-                a3 = vfmaq_f32(a3, vld1q_f32(xs1.add(12)), vcvtq_f32_s32(vmovl_high_s16(hi8_1)));
+                a0 = vfmaq_f32(
+                    a0,
+                    vld1q_f32(xs1),
+                    vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_1))),
+                );
+                a1 = vfmaq_f32(
+                    a1,
+                    vld1q_f32(xs1.add(4)),
+                    vcvtq_f32_s32(vmovl_high_s16(lo8_1)),
+                );
+                a2 = vfmaq_f32(
+                    a2,
+                    vld1q_f32(xs1.add(8)),
+                    vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_1))),
+                );
+                a3 = vfmaq_f32(
+                    a3,
+                    vld1q_f32(xs1.add(12)),
+                    vcvtq_f32_s32(vmovl_high_s16(hi8_1)),
+                );
 
-                let t8_2 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(vshrq_n_u8(packed, 4), mask3), one));
+                let t8_2 =
+                    vreinterpretq_s8_u8(vsubq_u8(vandq_u8(vshrq_n_u8(packed, 4), mask3), one));
                 let lo8_2 = vmovl_s8(vget_low_s8(t8_2));
                 let hi8_2 = vmovl_high_s8(t8_2);
                 let xs2 = xs0.add(32);
-                a0 = vfmaq_f32(a0, vld1q_f32(xs2), vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_2))));
-                a1 = vfmaq_f32(a1, vld1q_f32(xs2.add(4)), vcvtq_f32_s32(vmovl_high_s16(lo8_2)));
-                a2 = vfmaq_f32(a2, vld1q_f32(xs2.add(8)), vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_2))));
-                a3 = vfmaq_f32(a3, vld1q_f32(xs2.add(12)), vcvtq_f32_s32(vmovl_high_s16(hi8_2)));
+                a0 = vfmaq_f32(
+                    a0,
+                    vld1q_f32(xs2),
+                    vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_2))),
+                );
+                a1 = vfmaq_f32(
+                    a1,
+                    vld1q_f32(xs2.add(4)),
+                    vcvtq_f32_s32(vmovl_high_s16(lo8_2)),
+                );
+                a2 = vfmaq_f32(
+                    a2,
+                    vld1q_f32(xs2.add(8)),
+                    vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_2))),
+                );
+                a3 = vfmaq_f32(
+                    a3,
+                    vld1q_f32(xs2.add(12)),
+                    vcvtq_f32_s32(vmovl_high_s16(hi8_2)),
+                );
 
-                let t8_3 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(vshrq_n_u8(packed, 6), mask3), one));
+                let t8_3 =
+                    vreinterpretq_s8_u8(vsubq_u8(vandq_u8(vshrq_n_u8(packed, 6), mask3), one));
                 let lo8_3 = vmovl_s8(vget_low_s8(t8_3));
                 let hi8_3 = vmovl_high_s8(t8_3);
                 let xs3 = xs0.add(48);
-                a0 = vfmaq_f32(a0, vld1q_f32(xs3), vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_3))));
-                a1 = vfmaq_f32(a1, vld1q_f32(xs3.add(4)), vcvtq_f32_s32(vmovl_high_s16(lo8_3)));
-                a2 = vfmaq_f32(a2, vld1q_f32(xs3.add(8)), vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_3))));
-                a3 = vfmaq_f32(a3, vld1q_f32(xs3.add(12)), vcvtq_f32_s32(vmovl_high_s16(hi8_3)));
+                a0 = vfmaq_f32(
+                    a0,
+                    vld1q_f32(xs3),
+                    vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_3))),
+                );
+                a1 = vfmaq_f32(
+                    a1,
+                    vld1q_f32(xs3.add(4)),
+                    vcvtq_f32_s32(vmovl_high_s16(lo8_3)),
+                );
+                a2 = vfmaq_f32(
+                    a2,
+                    vld1q_f32(xs3.add(8)),
+                    vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_3))),
+                );
+                a3 = vfmaq_f32(
+                    a3,
+                    vld1q_f32(xs3.add(12)),
+                    vcvtq_f32_s32(vmovl_high_s16(hi8_3)),
+                );
             }
 
             let block_sum = vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3));
@@ -598,7 +726,6 @@ unsafe fn stq_row_dot_neon(row_bytes: &[u8], x: &[f32]) -> f32 {
         vaddvq_f32(row_acc)
     }
 }
-
 
 /// Fused NEON kernel: gathers codebook bytes with a 32-entry table lookup,
 /// extracts each 2-bit lane, and FMA-accumulates against the activations.
@@ -641,37 +768,101 @@ unsafe fn stq_dot_neon(bytes: &[u8], x: &[f32]) -> f32 {
             let lo8_0 = vmovl_s8(vget_low_s8(t8_0));
             let hi8_0 = vmovl_high_s8(t8_0);
             let xs0 = x.as_ptr().add(c * 64);
-            a0 = vfmaq_f32(a0, vld1q_f32(xs0), vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_0))));
-            a1 = vfmaq_f32(a1, vld1q_f32(xs0.add(4)), vcvtq_f32_s32(vmovl_high_s16(lo8_0)));
-            a2 = vfmaq_f32(a2, vld1q_f32(xs0.add(8)), vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_0))));
-            a3 = vfmaq_f32(a3, vld1q_f32(xs0.add(12)), vcvtq_f32_s32(vmovl_high_s16(hi8_0)));
+            a0 = vfmaq_f32(
+                a0,
+                vld1q_f32(xs0),
+                vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_0))),
+            );
+            a1 = vfmaq_f32(
+                a1,
+                vld1q_f32(xs0.add(4)),
+                vcvtq_f32_s32(vmovl_high_s16(lo8_0)),
+            );
+            a2 = vfmaq_f32(
+                a2,
+                vld1q_f32(xs0.add(8)),
+                vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_0))),
+            );
+            a3 = vfmaq_f32(
+                a3,
+                vld1q_f32(xs0.add(12)),
+                vcvtq_f32_s32(vmovl_high_s16(hi8_0)),
+            );
 
             let t8_1 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(vshrq_n_u8(packed, 2), mask3), one));
             let lo8_1 = vmovl_s8(vget_low_s8(t8_1));
             let hi8_1 = vmovl_high_s8(t8_1);
             let xs1 = xs0.add(16);
-            a0 = vfmaq_f32(a0, vld1q_f32(xs1), vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_1))));
-            a1 = vfmaq_f32(a1, vld1q_f32(xs1.add(4)), vcvtq_f32_s32(vmovl_high_s16(lo8_1)));
-            a2 = vfmaq_f32(a2, vld1q_f32(xs1.add(8)), vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_1))));
-            a3 = vfmaq_f32(a3, vld1q_f32(xs1.add(12)), vcvtq_f32_s32(vmovl_high_s16(hi8_1)));
+            a0 = vfmaq_f32(
+                a0,
+                vld1q_f32(xs1),
+                vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_1))),
+            );
+            a1 = vfmaq_f32(
+                a1,
+                vld1q_f32(xs1.add(4)),
+                vcvtq_f32_s32(vmovl_high_s16(lo8_1)),
+            );
+            a2 = vfmaq_f32(
+                a2,
+                vld1q_f32(xs1.add(8)),
+                vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_1))),
+            );
+            a3 = vfmaq_f32(
+                a3,
+                vld1q_f32(xs1.add(12)),
+                vcvtq_f32_s32(vmovl_high_s16(hi8_1)),
+            );
 
             let t8_2 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(vshrq_n_u8(packed, 4), mask3), one));
             let lo8_2 = vmovl_s8(vget_low_s8(t8_2));
             let hi8_2 = vmovl_high_s8(t8_2);
             let xs2 = xs0.add(32);
-            a0 = vfmaq_f32(a0, vld1q_f32(xs2), vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_2))));
-            a1 = vfmaq_f32(a1, vld1q_f32(xs2.add(4)), vcvtq_f32_s32(vmovl_high_s16(lo8_2)));
-            a2 = vfmaq_f32(a2, vld1q_f32(xs2.add(8)), vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_2))));
-            a3 = vfmaq_f32(a3, vld1q_f32(xs2.add(12)), vcvtq_f32_s32(vmovl_high_s16(hi8_2)));
+            a0 = vfmaq_f32(
+                a0,
+                vld1q_f32(xs2),
+                vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_2))),
+            );
+            a1 = vfmaq_f32(
+                a1,
+                vld1q_f32(xs2.add(4)),
+                vcvtq_f32_s32(vmovl_high_s16(lo8_2)),
+            );
+            a2 = vfmaq_f32(
+                a2,
+                vld1q_f32(xs2.add(8)),
+                vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_2))),
+            );
+            a3 = vfmaq_f32(
+                a3,
+                vld1q_f32(xs2.add(12)),
+                vcvtq_f32_s32(vmovl_high_s16(hi8_2)),
+            );
 
             let t8_3 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(vshrq_n_u8(packed, 6), mask3), one));
             let lo8_3 = vmovl_s8(vget_low_s8(t8_3));
             let hi8_3 = vmovl_high_s8(t8_3);
             let xs3 = xs0.add(48);
-            a0 = vfmaq_f32(a0, vld1q_f32(xs3), vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_3))));
-            a1 = vfmaq_f32(a1, vld1q_f32(xs3.add(4)), vcvtq_f32_s32(vmovl_high_s16(lo8_3)));
-            a2 = vfmaq_f32(a2, vld1q_f32(xs3.add(8)), vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_3))));
-            a3 = vfmaq_f32(a3, vld1q_f32(xs3.add(12)), vcvtq_f32_s32(vmovl_high_s16(hi8_3)));
+            a0 = vfmaq_f32(
+                a0,
+                vld1q_f32(xs3),
+                vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_3))),
+            );
+            a1 = vfmaq_f32(
+                a1,
+                vld1q_f32(xs3.add(4)),
+                vcvtq_f32_s32(vmovl_high_s16(lo8_3)),
+            );
+            a2 = vfmaq_f32(
+                a2,
+                vld1q_f32(xs3.add(8)),
+                vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_3))),
+            );
+            a3 = vfmaq_f32(
+                a3,
+                vld1q_f32(xs3.add(12)),
+                vcvtq_f32_s32(vmovl_high_s16(hi8_3)),
+            );
         }
         vaddvq_f32(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)))
     }
@@ -933,8 +1124,6 @@ fn decode_unchecked(dtype: DType, bytes: &[u8], out: &mut [f32]) {
     }
 }
 
-
-
 pub fn kernel_name() -> &'static str {
     #[cfg(target_arch = "aarch64")]
     if std::arch::is_aarch64_feature_detected!("neon") {
@@ -999,7 +1188,11 @@ unsafe fn dot_neon(a: &[f32], b: &[f32]) -> f32 {
     for i in (simd_end..vec_end).step_by(4) {
         // SAFETY: the four-element loads are within the equal-length slices.
         unsafe {
-            sum = vfmaq_f32(sum, vld1q_f32(a.as_ptr().add(i)), vld1q_f32(b.as_ptr().add(i)));
+            sum = vfmaq_f32(
+                sum,
+                vld1q_f32(a.as_ptr().add(i)),
+                vld1q_f32(b.as_ptr().add(i)),
+            );
         }
     }
     vaddvq_f32(sum) + dot_scalar(&a[vec_end..], &b[vec_end..])
