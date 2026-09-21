@@ -1,0 +1,30 @@
+services:
+  hy-mt-rs:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: hy-mt-rs:latest
+    container_name: hy-mt-rs
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      # Persist downloaded models and cache across container restarts
+      - ./data:/data
+      # Optional: mount local GGUF models directly
+      # - ./models:/models:ro
+    environment:
+      - RUST_LOG=info
+      # Optional: set custom Hugging Face endpoint/mirror for model downloads
+      # - HF_ENDPOINT=https://hf-mirror.com
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    # Optional command overrides:
+    # 1. Custom thread count:
+    # command: ["serve", "--listen", "0.0.0.0:8080", "--threads", "4"]
+    # 2. Use a mounted local model:
+    # command: ["serve", "--listen", "0.0.0.0:8080", "--model", "/models/Hy-MT2-1.8B-2Bit.gguf"]

@@ -1,9 +1,12 @@
 # syntax=docker/dockerfile:1
 
 # Stage 1: Build binary
-FROM rust:bookworm AS builder
+FROM rust:alpine AS builder
 
 WORKDIR /app
+
+# Install git for cargo git dependencies (candle-core) and build tools
+RUN apk add --no-cache git musl-dev
 
 # Copy dependency manifests and source code
 COPY Cargo.toml Cargo.lock ./
@@ -17,15 +20,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cp /app/target/release/hy-mt-rs /usr/local/bin/hy-mt-rs
 
 # Stage 2: Minimal runtime
-FROM debian:bookworm-slim AS runtime
+FROM alpine:latest AS runtime
 
-# Install CA certificates for HTTPS model downloads
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
+# Install CA certificates for HTTPS model downloads and curl for healthchecks
+RUN apk add --no-cache ca-certificates curl
 
 # Create non-root user and data directory
-RUN useradd -u 10001 -U -M -s /usr/sbin/nologin appuser && \
+RUN addgroup -g 10001 -S appuser && \
+    adduser -u 10001 -S -D -H -s /sbin/nologin -G appuser appuser && \
     mkdir -p /data && \
     chown -R appuser:appuser /data
 
