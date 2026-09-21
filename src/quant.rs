@@ -146,9 +146,12 @@ impl Weight {
 
         if batch == 1 {
             let mut out = vec![0.; rows];
-            let num_threads = rayon::current_num_threads();
-            let target_chunks = (num_threads * 4).max(1);
-            let chunk_size = (rows / target_chunks).clamp(32, 2048);
+            let chunk_size = chunk_rows(rows);
+            #[cfg(target_arch = "aarch64")]
+            if matches!(self.dtype(), DType::STQ1_0 | DType::Q6_K) && sdot_available() {
+                self.gemv_q8(input, &mut out, chunk_size);
+                return Ok(out);
+            }
             match self.dtype() {
                 DType::STQ1_0 => {
                     let all_bytes = self.bytes();
@@ -278,6 +281,98 @@ impl Weight {
         Ok(out)
     }
 
+    /// Batch-1 GEMV through int8 activations and SDOT kernels.
+    #[cfg(target_arch = "aarch64")]
+    fn gemv_q8(&self, input: &[f32], out: &mut [f32], chunk_size: usize) {
+        let cols = self.shape()[0];
+        let row_bytes = cols / self.dtype().block_len() * self.dtype().block_bytes();
+        let q8 = Q8::quantize(input);
+        let dtype = self.dtype();
+        let all_bytes = self.bytes();
+        out.par_chunks_mut(chunk_size)
+            .enumerate()
+            .for_each(|(chunk_idx, chunk)| {
+                let base_row = chunk_idx * chunk_size;
+                let chunk_bytes =
+                    &all_bytes[base_row * row_bytes..(base_row + chunk.len()) * row_bytes];
+                for (val, row) in chunk.iter_mut().zip(chunk_bytes.chunks_exact(row_bytes)) {
+                    // SAFETY: each row is a whole number of 256-weight blocks,
+                    // and `q8` holds one scale and 256 activations per block.
+                    *val = unsafe { row_dot_q8(dtype, row, &q8) };
+                }
+            });
+    }
+
+    /// Batch-1 query, key and value projections of one attention layer.
+    ///
+    /// All three read the same activations, so one parallel region replaces
+    /// three rayon forks and the int8 quantization is shared. Other batch
+    /// sizes and architectures fall back to three independent products.
+    pub fn gemv_qkv(
+        q: &Weight,
+        k: &Weight,
+        v: &Weight,
+        input: &[f32],
+    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+        let cols = q.shape()[0];
+        ensure!(
+            [q, k, v].iter().all(|weight| weight.shape().len() == 2)
+                && k.shape()[0] == cols
+                && v.shape()[0] == cols,
+            "query, key and value must be matrices that share an input width"
+        );
+        ensure!(input.len() == cols, "invalid activation shape for qkv");
+
+        #[cfg(target_arch = "aarch64")]
+        if sdot_available()
+            && [q, k, v]
+                .iter()
+                .all(|weight| matches!(weight.dtype(), DType::STQ1_0 | DType::Q6_K))
+        {
+            let q8 = Q8::quantize(input);
+            let weights = [q, k, v];
+            let mut outputs = [
+                vec![0.; q.shape()[1]],
+                vec![0.; k.shape()[1]],
+                vec![0.; v.shape()[1]],
+            ];
+            // One task per row chunk of each projection, so all three run in a
+            // single parallel region.
+            let mut tasks: Vec<(DType, &[u8], &mut [f32])> = Vec::new();
+            for (weight, output) in weights.iter().zip(outputs.iter_mut()) {
+                let dtype = weight.dtype();
+                let row_bytes = cols / dtype.block_len() * dtype.block_bytes();
+                let bytes = weight.bytes();
+                let chunk_size = chunk_rows(output.len());
+                for (chunk_index, chunk) in output.chunks_mut(chunk_size).enumerate() {
+                    let start = chunk_index * chunk_size;
+                    tasks.push((
+                        dtype,
+                        &bytes[start * row_bytes..(start + chunk.len()) * row_bytes],
+                        chunk,
+                    ));
+                }
+            }
+            tasks.par_iter_mut().for_each(|(dtype, bytes, output)| {
+                let row_bytes = cols / dtype.block_len() * dtype.block_bytes();
+                for (value, row) in output.iter_mut().zip(bytes.chunks_exact(row_bytes)) {
+                    // SAFETY: whole rows against whole activation groups.
+                    *value = unsafe { row_dot_q8(*dtype, row, &q8) };
+                }
+            });
+            // Release the chunk borrows before moving the outputs out.
+            drop(tasks);
+            let [q_out, k_out, v_out] = outputs;
+            return Ok((q_out, k_out, v_out));
+        }
+
+        Ok((
+            q.matmul(input, 1)?,
+            k.matmul(input, 1)?,
+            v.matmul(input, 1)?,
+        ))
+    }
+
     /// Fused gate and up projection with SiLU activation: `silu(gate(x)) * up(x)`.
     pub fn matmul_gate_up_silu(&self, up: &Weight, input: &[f32]) -> Result<Vec<f32>> {
         let (cols, rows) = (self.shape()[0], self.shape()[1]);
@@ -288,9 +383,40 @@ impl Weight {
         );
         let row_bytes = cols / self.dtype().block_len() * self.dtype().block_bytes();
         let mut out = vec![0.; rows];
-        let num_threads = rayon::current_num_threads();
-        let target_chunks = (num_threads * 4).max(1);
-        let chunk_size = (rows / target_chunks).clamp(32, 2048);
+        let chunk_size = chunk_rows(rows);
+
+        #[cfg(target_arch = "aarch64")]
+        if sdot_available()
+            && matches!(self.dtype(), DType::STQ1_0 | DType::Q6_K)
+            && self.dtype() == up.dtype()
+        {
+            let q8 = Q8::quantize(input);
+            let dtype = self.dtype();
+            let self_bytes = self.bytes();
+            let up_bytes = up.bytes();
+            out.par_chunks_mut(chunk_size)
+                .enumerate()
+                .for_each(|(chunk_idx, chunk)| {
+                    let base_row = chunk_idx * chunk_size;
+                    let self_chunk =
+                        &self_bytes[base_row * row_bytes..(base_row + chunk.len()) * row_bytes];
+                    let up_chunk =
+                        &up_bytes[base_row * row_bytes..(base_row + chunk.len()) * row_bytes];
+                    for ((val, g_b), u_b) in chunk
+                        .iter_mut()
+                        .zip(self_chunk.chunks_exact(row_bytes))
+                        .zip(up_chunk.chunks_exact(row_bytes))
+                    {
+                        // SAFETY: whole rows of 256-weight blocks against whole
+                        // activation groups, one scale per block.
+                        let (g, u) =
+                            unsafe { (row_dot_q8(dtype, g_b, &q8), row_dot_q8(dtype, u_b, &q8)) };
+                        let silu = g / (1.0 + (-g).exp());
+                        *val = silu * u;
+                    }
+                });
+            return Ok(out);
+        }
 
         match (self.dtype(), up.dtype()) {
             (DType::STQ1_0, DType::STQ1_0) => {
@@ -350,6 +476,129 @@ fn half(bytes: &[u8]) -> f32 {
     f16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).to_f32()
 }
 
+/// Elements per quantized activation group. Matches every packed block this
+/// kernel set understands, so one group's integer dot takes one FP32 scale.
+#[cfg(target_arch = "aarch64")]
+const Q8_GROUP: usize = 256;
+
+/// int8 activations with one scale per 256-element group.
+///
+/// Quantizing the activations is what lets the GEMV kernels use integer dot
+/// products (SDOT on ARMv8.2): four products per instruction instead of one
+/// NEON FMA per four products. The scale layout follows the packed weight
+/// blocks, so a block's contribution is `weight_scale * group_scale * dot`.
+#[cfg(target_arch = "aarch64")]
+struct Q8 {
+    values: Vec<i8>,
+    scales: Vec<f32>,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl Q8 {
+    fn quantize(input: &[f32]) -> Self {
+        let mut values = vec![0i8; input.len()];
+        let mut scales = Vec::with_capacity(input.len().div_ceil(Q8_GROUP));
+        for (source, target) in input.chunks(Q8_GROUP).zip(values.chunks_mut(Q8_GROUP)) {
+            let max = source.iter().fold(0f32, |acc, value| acc.max(value.abs()));
+            let (scale, inverse) = if max > 0. {
+                (max / 127., 127. / max)
+            } else {
+                (0., 0.)
+            };
+            scales.push(scale);
+            // SAFETY: both slices have the same length.
+            unsafe { quantize_group_neon(source, inverse, target) };
+        }
+        Self { values, scales }
+    }
+
+    fn values(&self) -> &[i8] {
+        &self.values
+    }
+
+    fn scales(&self) -> &[f32] {
+        &self.scales
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn quantize_group_neon(source: &[f32], inverse: f32, target: &mut [i8]) {
+    use std::arch::aarch64::*;
+    // SAFETY: `source` and `target` are equal length; all loads and stores stay
+    // inside one 16-element step, and the tail is handled scalar afterwards.
+    unsafe {
+        let inverse_vec = vdupq_n_f32(inverse);
+        let mut index = 0;
+        while index + 16 <= source.len() {
+            let ptr = source.as_ptr().add(index);
+            let mut lanes: [int16x4_t; 4] = [vdup_n_s16(0); 4];
+            for (vector, lane) in lanes.iter_mut().enumerate() {
+                let scaled = vmulq_f32(vld1q_f32(ptr.add(4 * vector)), inverse_vec);
+                *lane = vqmovn_s32(vcvtnq_s32_f32(scaled));
+            }
+            let low = vcombine_s16(lanes[0], lanes[1]);
+            let high = vcombine_s16(lanes[2], lanes[3]);
+            let packed = vcombine_s8(vqmovn_s16(low), vqmovn_s16(high));
+            vst1q_s8(target.as_mut_ptr().add(index), packed);
+            index += 16;
+        }
+        for (value, &activations) in target[index..].iter_mut().zip(&source[index..]) {
+            *value = (activations * inverse).round().clamp(-127., 127.) as i8;
+        }
+    }
+}
+
+/// ARMv8.2 signed dot product over 16 int8 lanes, four products per result
+/// lane. Written as one instruction because the `vdotq_s32` intrinsic needs a
+/// newer compiler than this crate's minimum supported Rust version.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn sdot(
+    acc: std::arch::aarch64::int32x4_t,
+    activations: std::arch::aarch64::int8x16_t,
+    digits: std::arch::aarch64::int8x16_t,
+) -> std::arch::aarch64::int32x4_t {
+    let mut out = acc;
+    // SAFETY: the instruction only reads the two vector registers and
+    // accumulates into `out`; no memory is touched.
+    unsafe {
+        std::arch::asm!(
+            "sdot {accumulator:v}.4s, {activations:v}.16b, {digits:v}.16b",
+            accumulator = inout(vreg) out,
+            activations = in(vreg) activations,
+            digits = in(vreg) digits,
+            options(nostack, nomem, pure)
+        );
+    }
+    out
+}
+
+/// True when this CPU has ARMv8.2 integer dot products (`sdot`).
+#[cfg(target_arch = "aarch64")]
+fn sdot_available() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let available = std::arch::is_aarch64_feature_detected!("dotprod");
+            STATE.store(if available { 1 } else { 2 }, Ordering::Relaxed);
+            available
+        }
+    }
+}
+
+/// Rows per rayon task for the batch-1 GEMV path. Rows are short once the
+/// integer kernels run, so many small tasks balance better than a few large
+/// ones; 32 rows is the useful floor at roughly 2 microseconds of work.
+fn chunk_rows(rows: usize) -> usize {
+    let target_chunks = (rayon::current_num_threads() * 32).max(1);
+    (rows / target_chunks).clamp(32, 2048)
+}
+
+#[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn half_raw(ptr: *const u8) -> f32 {
     let bits = unsafe { (ptr as *const u16).read_unaligned() };
@@ -727,6 +976,102 @@ unsafe fn stq_row_dot_neon(row_bytes: &[u8], x: &[f32]) -> f32 {
     }
 }
 
+/// Per-lane digit tables: `STQ_DIGIT_TABLES[p][index]` is the `p`-th ternary
+/// digit of codebook entry `index` as `{-1, 0, 1}`, already in byte form. They
+/// let one `tbl` produce a whole 16-lane digit vector per `p`, instead of one
+/// table lookup plus a shift, mask and subtract per `p`.
+#[cfg(target_arch = "aarch64")]
+const STQ_DIGIT_TABLES: [[u8; 32]; 4] = digit_tables();
+
+#[cfg(target_arch = "aarch64")]
+const fn digit_tables() -> [[u8; 32]; 4] {
+    let mut tables = [[0u8; 32]; 4];
+    let mut p = 0;
+    while p < 4 {
+        let mut index = 0;
+        while index < 32 {
+            tables[p][index] = ((STQ_CODEBOOK[index] >> (2 * p)) & 3).wrapping_sub(1);
+            index += 1;
+        }
+        p += 1;
+    }
+    tables
+}
+
+/// Expand chunk `c` of one 42-byte STQ block into the four 16-lane ternary
+/// digit vectors, one per output lane group `p`. Digits are `{-1, 0, 1}`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn stq_digit_lanes(
+    bytes: *const u8,
+    c: usize,
+    tables: &[std::arch::aarch64::uint8x16x2_t; 4],
+    sign_shifts: std::arch::aarch64::int8x16_t,
+) -> [std::arch::aarch64::int8x16_t; 4] {
+    use std::arch::aarch64::*;
+    // SAFETY: the caller passes a 42-byte block and `c < 4`; every index stays
+    // below 32, so each lookup lands inside its 32-byte table.
+    unsafe {
+        let mask15 = vdup_n_u8(15);
+        let mask16 = vdupq_n_u8(0x10);
+        let codes = vld1_u8(bytes.add(8 * c));
+        let low = vand_u8(codes, mask15);
+        let high = vshr_n_u8(codes, 4);
+        let nibbles = vcombine_u8(vzip1_u8(low, high), vzip2_u8(low, high));
+        let sign_bits = vcombine_u8(
+            vdup_n_u8(*bytes.add(32 + 2 * c)),
+            vdup_n_u8(*bytes.add(33 + 2 * c)),
+        );
+        let signs = vandq_u8(vshlq_u8(sign_bits, sign_shifts), mask16);
+        let index = vorrq_u8(nibbles, signs);
+        [
+            vreinterpretq_s8_u8(vqtbl2q_u8(tables[0], index)),
+            vreinterpretq_s8_u8(vqtbl2q_u8(tables[1], index)),
+            vreinterpretq_s8_u8(vqtbl2q_u8(tables[2], index)),
+            vreinterpretq_s8_u8(vqtbl2q_u8(tables[3], index)),
+        ]
+    }
+}
+
+/// ARMv8.2 SDOT row dot: each instruction accumulates sixteen int8 products,
+/// so one 256-weight block costs sixteen SDOTs plus its expansion.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,dotprod")]
+unsafe fn stq_row_dot_sdot(row_bytes: &[u8], activations: &[i8], scales: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+    // SAFETY: callers pass whole 42-byte blocks, one activation group and one
+    // scale per block, and at least 256 activations per block.
+    unsafe {
+        let tables: [uint8x16x2_t; 4] = std::array::from_fn(|p| {
+            uint8x16x2_t(
+                vld1q_u8(STQ_DIGIT_TABLES[p].as_ptr()),
+                vld1q_u8(STQ_DIGIT_TABLES[p].as_ptr().add(16)),
+            )
+        });
+        let sign_shifts: [i8; 16] = [4, 3, 2, 1, 0, -1, -2, -3, 4, 3, 2, 1, 0, -1, -2, -3];
+        let sign_shifts = vld1q_s8(sign_shifts.as_ptr());
+        let mut row_acc = vdupq_n_f32(0.);
+        let mut x_ptr = activations.as_ptr();
+
+        for (&scale, block) in scales.iter().zip(row_bytes.as_chunks::<42>().0) {
+            let block_scale = half_raw(block.as_ptr().add(40)) * scale;
+            let mut acc = vdupq_n_s32(0);
+            for c in 0..4usize {
+                for (p, digits) in stq_digit_lanes(block.as_ptr(), c, &tables, sign_shifts)
+                    .iter()
+                    .enumerate()
+                {
+                    acc = sdot(acc, vld1q_s8(x_ptr.add(c * 64 + p * 16)), *digits);
+                }
+            }
+            row_acc = vfmaq_n_f32(row_acc, vcvtq_f32_s32(acc), block_scale);
+            x_ptr = x_ptr.add(256);
+        }
+
+        vaddvq_f32(row_acc)
+    }
+}
+
 /// Fused NEON kernel: gathers codebook bytes with a 32-entry table lookup,
 /// extracts each 2-bit lane, and FMA-accumulates against the activations.
 #[cfg(target_arch = "aarch64")]
@@ -978,6 +1323,71 @@ unsafe fn q6_row_dot_neon(row_bytes: &[u8], x: &[f32]) -> f32 {
             x_ptr = x_ptr.add(256);
         }
         vaddvq_f32(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)))
+    }
+}
+
+/// One packed row of `dtype` against quantized activations.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn row_dot_q8(dtype: DType, row: &[u8], q8: &Q8) -> f32 {
+    // SAFETY: callers pass whole rows, so every row is a whole number of
+    // 256-weight blocks, and `q8` holds one scale and 256 values per block.
+    unsafe {
+        if dtype == DType::STQ1_0 {
+            stq_row_dot_sdot(row, q8.values(), q8.scales())
+        } else {
+            q6_row_dot_sdot(row, q8.values(), q8.scales())
+        }
+    }
+}
+
+/// ARMv8.2 SDOT row dot for Q6_K. Integer dot products replace the per-lane
+/// widening, and each 16-weight plane keeps its own FP16 and int8 scales.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,dotprod")]
+unsafe fn q6_row_dot_sdot(row_bytes: &[u8], activations: &[i8], scales: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+    // SAFETY: callers pass whole 210-byte blocks, one activation group and one
+    // scale per block, and at least 256 activations per block.
+    unsafe {
+        let mask15 = vdupq_n_u8(15);
+        let mask3 = vdupq_n_u8(3);
+        let c32 = vdupq_n_s8(32);
+        let mut row_acc = vdupq_n_f32(0.);
+        let mut x_ptr = activations.as_ptr();
+
+        for (&scale, block) in scales.iter().zip(row_bytes.as_chunks::<210>().0) {
+            let d = half_raw(block.as_ptr().add(208)) * scale;
+            for c in 0..2usize {
+                let ql = block.as_ptr().add(c * 64);
+                let qh = block.as_ptr().add(128 + c * 32);
+                let sc = block.as_ptr().add(192 + c * 8);
+                for p in 0..4usize {
+                    for h in 0..2usize {
+                        let qlv = vld1q_u8(ql.add((p & 1) * 32 + h * 16));
+                        let qhv = vld1q_u8(qh.add(h * 16));
+                        let lo6 = match p {
+                            2 | 3 => vandq_u8(vshrq_n_u8(qlv, 4), mask15),
+                            _ => vandq_u8(qlv, mask15),
+                        };
+                        let bits = match p {
+                            0 => qhv,
+                            1 => vshrq_n_u8(qhv, 2),
+                            2 => vshrq_n_u8(qhv, 4),
+                            _ => vshrq_n_u8(qhv, 6),
+                        };
+                        let q6 = vorrq_u8(lo6, vshlq_n_u8(vandq_u8(bits, mask3), 4));
+                        let digits = vsubq_s8(vreinterpretq_s8_u8(q6), c32);
+                        let base = x_ptr.add(c * 128 + p * 32 + h * 16);
+                        let acc = sdot(vdupq_n_s32(0), vld1q_s8(base), digits);
+                        let plane = d * (*sc.add(2 * p + h) as i8) as f32;
+                        row_acc = vfmaq_n_f32(row_acc, vcvtq_f32_s32(acc), plane);
+                    }
+                }
+            }
+            x_ptr = x_ptr.add(256);
+        }
+        vaddvq_f32(row_acc)
     }
 }
 
@@ -1325,6 +1735,347 @@ mod tests {
             decode_unchecked(DType::Q6_K, &block, &mut decoded);
             let expected = dot(&decoded, &x);
             assert!((q6_dot(&block, &x) - expected).abs() < 1e-3, "seed {seed}");
+        }
+    }
+
+    /// Kernel-level throughput probe for the batch-1 GEMV path. Needs a local
+    /// 1.25Bit GGUF:
+    /// `cargo test --release --lib -- --ignored --nocapture kernel_throughput`.
+    /// Set `HY_MT_BENCH_MODEL` to use another model file.
+    #[test]
+    #[ignore = "requires a local model file"]
+    fn kernel_throughput() -> Result<()> {
+        use crate::gguf::Gguf;
+        use std::time::Instant;
+
+        let path = std::env::var("HY_MT_BENCH_MODEL").unwrap_or_else(|_| {
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/models/Hy-MT2-1.8B-1.25Bit.gguf"
+            )
+            .into()
+        });
+        let gguf = Gguf::open(&path, Profile::Auto)?;
+
+        let report = |label: &str, rows: usize, elements: usize, bytes: usize, secs: f64| {
+            println!(
+                "{label:<26} {rows:>7} rows {:>7.1} ns/row {:>7.2} Gweight/s {:>7.2} GB/s",
+                secs * 1e9 / rows as f64,
+                elements as f64 / secs / 1e9,
+                bytes as f64 / secs / 1e9,
+            );
+        };
+
+        let time = |mut body: Box<dyn FnMut() + '_>| -> f64 {
+            body();
+            body();
+            let start = Instant::now();
+            body();
+            start.elapsed().as_secs_f64()
+        };
+
+        // Single-thread row kernels: the shipping integer path against the F32
+        // fallback, over the three shapes one decode step touches.
+        let shapes = [
+            ("blk.0.ffn_gate.weight", "stq ffn_gate"),
+            ("blk.0.attn_q.weight", "stq attn_q"),
+            ("blk.0.ffn_down.weight", "stq ffn_down"),
+            ("token_embd.weight", "q6 lm_head"),
+        ];
+        for (name, label) in shapes {
+            let weight = gguf.tensor(name)?;
+            let (rows, cols) = (weight.shape()[1], weight.shape()[0]);
+            let row_bytes = cols / 256 * weight.dtype().block_bytes();
+            let bytes = weight.bytes();
+            let x: Vec<f32> = (0..cols).map(|i| ((i as f32) * 0.017).sin()).collect();
+            let fallback: fn(&[u8], &[f32]) -> f32 = if weight.dtype() == DType::STQ1_0 {
+                stq_row_dot
+            } else {
+                q6_row_dot
+            };
+            let secs = time(Box::new(|| {
+                let mut acc = 0f32;
+                for row in bytes.chunks_exact(row_bytes) {
+                    acc += fallback(row, &x);
+                }
+                std::hint::black_box(acc);
+            }));
+            report(
+                &format!("{label} f32"),
+                rows,
+                rows * cols,
+                rows * row_bytes,
+                secs,
+            );
+
+            #[cfg(target_arch = "aarch64")]
+            if sdot_available() {
+                let q8 = Q8::quantize(&x);
+                let dtype = weight.dtype();
+                let secs = time(Box::new(|| {
+                    let mut acc = 0f32;
+                    for row in bytes.chunks_exact(row_bytes) {
+                        // SAFETY: whole rows against whole activation groups.
+                        acc += unsafe { row_dot_q8(dtype, row, &q8) };
+                    }
+                    std::hint::black_box(acc);
+                }));
+                report(
+                    &format!("{label} sdot"),
+                    rows,
+                    rows * cols,
+                    rows * row_bytes,
+                    secs,
+                );
+            }
+        }
+
+        // The fused projection group must match three separate products.
+        let (q, k, v) = (
+            gguf.tensor("blk.0.attn_q.weight")?,
+            gguf.tensor("blk.0.attn_k.weight")?,
+            gguf.tensor("blk.0.attn_v.weight")?,
+        );
+        let input: Vec<f32> = (0..q.shape()[0])
+            .map(|i| ((i as f32) * 0.023).sin())
+            .collect();
+        let (fused_q, fused_k, fused_v) = Weight::gemv_qkv(&q, &k, &v, &input)?;
+        for (label, fused, separate) in [
+            ("q", fused_q, q.matmul(&input, 1)?),
+            ("k", fused_k, k.matmul(&input, 1)?),
+            ("v", fused_v, v.matmul(&input, 1)?),
+        ] {
+            assert_eq!(fused, separate, "fused {label} projection differs");
+        }
+
+        // F32 attention-style dot, 128-wide keys.
+        for len in [128usize, 2048] {
+            let a: Vec<f32> = (0..len).map(|i| (i as f32 * 0.3).sin()).collect();
+            let b: Vec<f32> = (0..len).map(|i| (i as f32 * 0.7).cos()).collect();
+            let reps = 20_000_000 / len;
+            let secs = time(Box::new(|| {
+                let mut acc = 0f32;
+                for _ in 0..reps {
+                    acc += dot(&a, &b);
+                }
+                std::hint::black_box(acc);
+            }));
+            report(
+                &format!("dot f32 len={len}"),
+                reps,
+                reps * len,
+                reps * len * 8,
+                secs,
+            );
+        }
+
+        // Every decoder weight one decode step touches, through the shipping
+        // `matmul` entry point at several pool sizes.
+        let mut decoder: Vec<Weight> = gguf
+            .tensors
+            .keys()
+            .filter(|name| name.starts_with("blk.") && name.ends_with(".weight"))
+            .map(|name| gguf.tensor(name))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|weight| weight.dtype() == DType::STQ1_0)
+            .collect();
+        decoder.sort_by_key(|weight| weight.name().to_string());
+        let decoder_bytes: usize = decoder.iter().map(|weight| weight.bytes().len()).sum();
+        let decoder_elements: usize = decoder
+            .iter()
+            .map(|weight| weight.shape()[0] * weight.shape()[1])
+            .sum();
+        let activations: std::collections::HashMap<usize, Vec<f32>> = decoder
+            .iter()
+            .map(|weight| weight.shape()[0])
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .map(|cols| {
+                (
+                    cols,
+                    (0..cols).map(|i| ((i as f32) * 0.017).sin()).collect(),
+                )
+            })
+            .collect();
+        for threads in [1usize, 2, 4, 8] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .start_handler(|_| pin_to_performance_cores())
+                .build()?;
+            let secs = time(Box::new(|| {
+                let mut acc = 0f32;
+                pool.install(|| {
+                    for weight in &decoder {
+                        let out = weight
+                            .matmul(&activations[&weight.shape()[0]], 1)
+                            .expect("gemv");
+                        acc += out[0];
+                    }
+                });
+                std::hint::black_box(acc);
+            }));
+            report(
+                &format!("decoder gemv {threads}t"),
+                decoder.len(),
+                decoder_elements,
+                decoder_bytes,
+                secs,
+            );
+
+            // The same rows in a single parallel region: the difference
+            // against the loop above is one rayon region per `matmul` call.
+            #[cfg(target_arch = "aarch64")]
+            if sdot_available() {
+                let flat: Vec<(&[u8], DType, usize)> = decoder
+                    .iter()
+                    .flat_map(|weight| {
+                        let cols = weight.shape()[0];
+                        let dtype = weight.dtype();
+                        let row_bytes = cols / 256 * dtype.block_bytes();
+                        weight
+                            .bytes()
+                            .chunks_exact(row_bytes)
+                            .map(move |row| (row, dtype, cols))
+                    })
+                    .collect();
+                let quantized: std::collections::HashMap<usize, Q8> = activations
+                    .iter()
+                    .map(|(cols, values)| (*cols, Q8::quantize(values)))
+                    .collect();
+                let secs = time(Box::new(|| {
+                    let acc: f32 = pool.install(|| {
+                        flat.par_iter()
+                            .map(|(row, dtype, cols)| {
+                                // SAFETY: whole rows against whole activation groups.
+                                unsafe { row_dot_q8(*dtype, row, &quantized[cols]) }
+                            })
+                            .sum()
+                    });
+                    std::hint::black_box(acc);
+                }));
+                report(
+                    &format!("decoder flat {threads}t"),
+                    decoder.len(),
+                    decoder_elements,
+                    decoder_bytes,
+                    secs,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn pin_to_performance_cores() {
+        #[cfg(target_os = "macos")]
+        {
+            unsafe extern "C" {
+                fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+            }
+            // SAFETY: only this worker thread's QoS class changes.
+            unsafe {
+                pthread_set_qos_class_self_np(0x21, 0);
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn int8_activation_groups_round_trip() {
+        let values: Vec<f32> = (0..1024).map(|i| ((i as f32) * 0.37).sin() * 3.).collect();
+        let q8 = Q8::quantize(&values);
+        assert_eq!(q8.values().len(), values.len());
+        assert_eq!(q8.scales().len(), 4);
+        for (group, scale) in q8.scales().iter().enumerate() {
+            for (offset, &value) in values[group * Q8_GROUP..(group + 1) * Q8_GROUP]
+                .iter()
+                .enumerate()
+            {
+                let restored = q8.values()[group * Q8_GROUP + offset] as f32 * scale;
+                assert!(
+                    (restored - value).abs() <= scale * 0.5 + 1e-6,
+                    "group {group} offset {offset}: {restored} vs {value}"
+                );
+            }
+        }
+        // An all-zero group must not divide by zero.
+        let q8 = Q8::quantize(&vec![0.; 256]);
+        assert_eq!(q8.scales(), &[0.]);
+        assert!(q8.values().iter().all(|&v| v == 0));
+    }
+
+    /// SDOT kernels must agree with the exact decode of the same activations.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn sdot_kernels_match_int8_reference() {
+        if !sdot_available() {
+            return;
+        }
+        for seed in 0..8u32 {
+            let mut x: Vec<f32> = (0..512)
+                .map(|i| ((i as f32 + seed as f32) * 0.11).sin() * 2.)
+                .collect();
+            // Give each 256-element group a different dynamic range.
+            for (group, values) in x.chunks_mut(Q8_GROUP).enumerate() {
+                for value in values {
+                    *value *= 1. + group as f32;
+                }
+            }
+            let q8 = Q8::quantize(&x);
+
+            let mut stq = vec![0u8; 84];
+            for (i, slot) in stq.iter_mut().enumerate() {
+                *slot = (seed.wrapping_mul(2654435761).wrapping_add(i as u32 * 7)) as u8;
+            }
+            stq[40..42].copy_from_slice(&f16::from_f32(0.5).to_le_bytes());
+            stq[82..84].copy_from_slice(&f16::from_f32(0.25).to_le_bytes());
+            let mut stq_weights = vec![0.; 512];
+            decode(DType::STQ1_0, &stq, &mut stq_weights).unwrap();
+            let expected: f64 = stq_weights
+                .iter()
+                .enumerate()
+                .map(|(i, w)| *w as f64 * q8.values()[i] as f64 * q8.scales()[i / Q8_GROUP] as f64)
+                .sum();
+            // SAFETY: the row is two whole 42-byte blocks and `q8` covers them.
+            let got = unsafe { stq_row_dot_sdot(&stq, q8.values(), q8.scales()) };
+            let magnitude: f64 = stq_weights
+                .iter()
+                .enumerate()
+                .map(|(i, w)| {
+                    (*w as f64 * q8.values()[i] as f64 * q8.scales()[i / Q8_GROUP] as f64).abs()
+                })
+                .sum();
+            assert!(
+                (got as f64 - expected).abs() <= magnitude * 1e-5,
+                "seed {seed}: sdot {got} vs reference {expected}"
+            );
+
+            let mut q6 = vec![0u8; 420];
+            for (i, slot) in q6.iter_mut().enumerate() {
+                *slot = (seed.wrapping_mul(40503).wrapping_add(i as u32 * 13)) as u8;
+            }
+            q6[208..210].copy_from_slice(&f16::from_f32(0.125).to_le_bytes());
+            q6[418..420].copy_from_slice(&f16::from_f32(0.75).to_le_bytes());
+            let mut q6_weights = vec![0.; 512];
+            decode(DType::Q6_K, &q6, &mut q6_weights).unwrap();
+            let expected: f64 = q6_weights
+                .iter()
+                .enumerate()
+                .map(|(i, w)| *w as f64 * q8.values()[i] as f64 * q8.scales()[i / Q8_GROUP] as f64)
+                .sum();
+            let magnitude: f64 = q6_weights
+                .iter()
+                .enumerate()
+                .map(|(i, w)| {
+                    (*w as f64 * q8.values()[i] as f64 * q8.scales()[i / Q8_GROUP] as f64).abs()
+                })
+                .sum();
+            // SAFETY: the row is two whole 210-byte blocks and `q8` covers them.
+            let got = unsafe { q6_row_dot_sdot(&q6, q8.values(), q8.scales()) };
+            assert!(
+                (got as f64 - expected).abs() <= magnitude * 1e-5,
+                "seed {seed}: sdot {got} vs reference {expected}"
+            );
         }
     }
 

@@ -97,8 +97,36 @@ struct Bench {
     concurrency: usize,
 }
 
+/// Worker threads for the shared CPU pool.
+///
+/// macOS exposes asymmetric cores as `perflevel0` (performance) and
+/// `perflevel1` (efficiency). Pool threads run at user-interactive QoS, which
+/// the scheduler places on the performance cores, so including the efficiency
+/// cores only oversubscribes those and slows decode. Elsewhere every logical
+/// CPU is used.
 fn default_threads() -> usize {
+    #[cfg(target_os = "macos")]
+    if let Some(performance) = performance_core_count() {
+        return performance;
+    }
     std::thread::available_parallelism().map_or(1, usize::from)
+}
+
+#[cfg(target_os = "macos")]
+fn performance_core_count() -> Option<usize> {
+    let mut count: libc::c_int = 0;
+    let mut size = std::mem::size_of_val(&count);
+    // SAFETY: sysctlbyname writes at most `size` bytes into `count`.
+    let status = unsafe {
+        libc::sysctlbyname(
+            c"hw.perflevel0.logicalcpu".as_ptr(),
+            std::ptr::from_mut(&mut count).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (status == 0 && count > 0).then_some(count as usize)
 }
 
 fn main() -> Result<()> {

@@ -1,5 +1,5 @@
 {
-  "recorded_at": "2026-09-21T04:06:28.998337+00:00",
+  "recorded_at": "2026-09-21T06:16:59.785643+00:00",
   "hardware": {
     "os": "Darwin",
     "architecture": "arm64",
@@ -24,8 +24,8 @@
         "vocab_size": 120818
       },
       "kernel": "neon",
-      "load_ms": 292.46875,
-      "peak_rss_bytes": 617594880,
+      "load_ms": 877.5734170000001,
+      "peak_rss_bytes": 596361216,
       "profile": "tencent-stq1",
       "prompt_token_ids": [
         120000,
@@ -49,10 +49,10 @@
             "finish_reason": "stop",
             "text": "你好，世界。",
             "timing": {
-              "decode_ms": 134.06783299999995,
-              "first_token_ms": 180.868625,
-              "prefill_ms": 180.42445800000002,
-              "total_ms": 314.93645799999996
+              "decode_ms": 49.16395899999998,
+              "first_token_ms": 182.845416,
+              "prefill_ms": 182.404833,
+              "total_ms": 232.00937499999998
             },
             "token_ids": [
               17687,
@@ -67,12 +67,12 @@
               "total_tokens": 19
             }
           },
-          "decode_tokens_per_second": 29.835642976343188,
-          "prefill_tokens_per_second": 77.59480147641624
+          "decode_tokens_per_second": 81.36041281785305,
+          "prefill_tokens_per_second": 76.75235228005171
         }
       ],
       "threads": 8,
-      "wall_ms": 315.071375
+      "wall_ms": 232.118625
     },
     {
       "model": "stq",
@@ -91,8 +91,8 @@
         "vocab_size": 120818
       },
       "kernel": "neon",
-      "load_ms": 281.822,
-      "peak_rss_bytes": 657653760,
+      "load_ms": 290.633209,
+      "peak_rss_bytes": 625885184,
       "profile": "tencent-stq1",
       "prompt_token_ids": [
         120000,
@@ -116,10 +116,10 @@
             "finish_reason": "stop",
             "text": "你好，世界。",
             "timing": {
-              "decode_ms": 193.84083300000003,
-              "first_token_ms": 390.419833,
-              "prefill_ms": 389.981083,
-              "total_ms": 584.260666
+              "decode_ms": 68.87925000000001,
+              "first_token_ms": 289.100041,
+              "prefill_ms": 288.653125,
+              "total_ms": 357.979291
             },
             "token_ids": [
               17687,
@@ -134,18 +134,18 @@
               "total_tokens": 19
             }
           },
-          "decode_tokens_per_second": 20.635487054474222,
-          "prefill_tokens_per_second": 35.899177191628034
+          "decode_tokens_per_second": 58.07264161558088,
+          "prefill_tokens_per_second": 48.5011205057974
         },
         {
           "completion": {
             "finish_reason": "stop",
             "text": "你好，世界。",
             "timing": {
-              "decode_ms": 276.10512499999993,
-              "first_token_ms": 303.481125,
-              "prefill_ms": 303.012291,
-              "total_ms": 579.58625
+              "decode_ms": 78.16541700000005,
+              "first_token_ms": 302.52766599999995,
+              "prefill_ms": 302.087541,
+              "total_ms": 380.693083
             },
             "token_ids": [
               17687,
@@ -160,12 +160,12 @@
               "total_tokens": 19
             }
           },
-          "decode_tokens_per_second": 14.487235613609132,
-          "prefill_tokens_per_second": 46.202746277377905
+          "decode_tokens_per_second": 51.17352601086997,
+          "prefill_tokens_per_second": 46.344182066085274
         }
       ],
       "threads": 8,
-      "wall_ms": 584.339125
+      "wall_ms": 380.79120900000004
     },
     {
       "model": "q2c",
@@ -184,8 +184,8 @@
         "vocab_size": 120818
       },
       "kernel": "neon",
-      "load_ms": 357.367708,
-      "peak_rss_bytes": 753238016,
+      "load_ms": 1228.244042,
+      "peak_rss_bytes": 727613440,
       "profile": "tencent-q2-0c",
       "prompt_token_ids": [
         120000,
@@ -209,10 +209,10 @@
             "finish_reason": "stop",
             "text": "你好，世界。",
             "timing": {
-              "decode_ms": 752.2358749999999,
-              "first_token_ms": 325.317583,
-              "prefill_ms": 324.872958,
-              "total_ms": 1077.5534579999999
+              "decode_ms": 693.5830000000001,
+              "first_token_ms": 335.913916,
+              "prefill_ms": 335.441166,
+              "total_ms": 1029.496916
             },
             "token_ids": [
               17687,
@@ -227,12 +227,12 @@
               "total_tokens": 19
             }
           },
-          "decode_tokens_per_second": 5.317481036117828,
-          "prefill_tokens_per_second": 43.09376836467872
+          "decode_tokens_per_second": 5.767154039242599,
+          "prefill_tokens_per_second": 41.7360819691403
         }
       ],
       "threads": 8,
-      "wall_ms": 1077.637291
+      "wall_ms": 1029.6190000000001
     },
     {
       "model": "q2c",
@@ -251,8 +251,8 @@
         "vocab_size": 120818
       },
       "kernel": "neon",
-      "load_ms": 353.633084,
-      "peak_rss_bytes": 800096256,
+      "load_ms": 356.26725,
+      "peak_rss_bytes": 749993984,
       "profile": "tencent-q2-0c",
       "prompt_token_ids": [
         120000,
@@ -276,10 +276,10 @@
             "finish_reason": "stop",
             "text": "你好，世界。",
             "timing": {
-              "decode_ms": 1121.066792,
-              "first_token_ms": 543.8795,
-              "prefill_ms": 543.433875,
-              "total_ms": 1664.946292
+              "decode_ms": 1443.285417,
+              "first_token_ms": 536.051791,
+              "prefill_ms": 535.5930410000001,
+              "total_ms": 1979.337208
             },
             "token_ids": [
               17687,
@@ -294,18 +294,18 @@
               "total_tokens": 19
             }
           },
-          "decode_tokens_per_second": 3.5680300482935006,
-          "prefill_tokens_per_second": 25.76210399103295
+          "decode_tokens_per_second": 2.7714545944172038,
+          "prefill_tokens_per_second": 26.139249258841655
         },
         {
           "completion": {
             "finish_reason": "stop",
             "text": "你好，世界。",
             "timing": {
-              "decode_ms": 1254.5193749999999,
-              "first_token_ms": 742.300584,
-              "prefill_ms": 741.855417,
-              "total_ms": 1996.819959
+              "decode_ms": 902.4128330000001,
+              "first_token_ms": 536.047875,
+              "prefill_ms": 535.588417,
+              "total_ms": 1438.460708
             },
             "token_ids": [
               17687,
@@ -320,12 +320,12 @@
               "total_tokens": 19
             }
           },
-          "decode_tokens_per_second": 3.1884720791976613,
-          "prefill_tokens_per_second": 18.87160176927036
+          "decode_tokens_per_second": 4.432561078173408,
+          "prefill_tokens_per_second": 26.139474931923328
         }
       ],
       "threads": 8,
-      "wall_ms": 1996.903
+      "wall_ms": 1979.469458
     },
     {
       "model": "7b",
@@ -344,8 +344,8 @@
         "vocab_size": 128167
       },
       "kernel": "neon",
-      "load_ms": 82.644042,
-      "peak_rss_bytes": 4908646400,
+      "load_ms": 87.091959,
+      "peak_rss_bytes": 4809342976,
       "profile": "standard",
       "prompt_token_ids": [
         127958,
@@ -368,10 +368,10 @@
             "finish_reason": "stop",
             "text": "你好，世界。",
             "timing": {
-              "decode_ms": 1587.196875,
-              "first_token_ms": 926.712708,
-              "prefill_ms": 926.234208,
-              "total_ms": 2513.909583
+              "decode_ms": 1353.5689160000002,
+              "first_token_ms": 844.458834,
+              "prefill_ms": 843.9991669999999,
+              "total_ms": 2198.02775
             },
             "token_ids": [
               109419,
@@ -386,12 +386,12 @@
               "total_tokens": 18
             }
           },
-          "decode_tokens_per_second": 2.5201662522174506,
-          "prefill_tokens_per_second": 14.035327013100341
+          "decode_tokens_per_second": 2.9551506042415645,
+          "prefill_tokens_per_second": 15.40285880400638
         }
       ],
       "threads": 8,
-      "wall_ms": 2514.044791
+      "wall_ms": 2198.131208
     },
     {
       "model": "7b",
@@ -410,8 +410,8 @@
         "vocab_size": 128167
       },
       "kernel": "neon",
-      "load_ms": 88.61616699999999,
-      "peak_rss_bytes": 4999905280,
+      "load_ms": 90.835375,
+      "peak_rss_bytes": 4903010304,
       "profile": "standard",
       "prompt_token_ids": [
         127958,
@@ -434,10 +434,10 @@
             "finish_reason": "stop",
             "text": "你好，世界。",
             "timing": {
-              "decode_ms": 1631.9961250000001,
-              "first_token_ms": 2386.529334,
-              "prefill_ms": 2386.060375,
-              "total_ms": 4018.525459
+              "decode_ms": 2701.213208,
+              "first_token_ms": 1526.5890419999998,
+              "prefill_ms": 1526.1295420000001,
+              "total_ms": 4227.80225
             },
             "token_ids": [
               109419,
@@ -452,18 +452,18 @@
               "total_tokens": 18
             }
           },
-          "decode_tokens_per_second": 2.450986211747286,
-          "prefill_tokens_per_second": 5.448311424223706
+          "decode_tokens_per_second": 1.480816097060932,
+          "prefill_tokens_per_second": 8.51828081577101
         },
         {
           "completion": {
             "finish_reason": "stop",
             "text": "你好，世界。",
             "timing": {
-              "decode_ms": 3256.921374999999,
-              "first_token_ms": 1532.4806660000002,
-              "prefill_ms": 1532.004916,
-              "total_ms": 4789.402040999999
+              "decode_ms": 1668.0769580000003,
+              "first_token_ms": 1526.593834,
+              "prefill_ms": 1526.129167,
+              "total_ms": 3194.6707920000003
             },
             "token_ids": [
               109419,
@@ -478,12 +478,12 @@
               "total_tokens": 18
             }
           },
-          "decode_tokens_per_second": 1.228153688542758,
-          "prefill_tokens_per_second": 8.485612457395012
+          "decode_tokens_per_second": 2.3979708974554392,
+          "prefill_tokens_per_second": 8.518282908880412
         }
       ],
       "threads": 8,
-      "wall_ms": 4789.501583
+      "wall_ms": 4227.886791999999
     }
   ]
 }

@@ -1,6 +1,6 @@
 # Validation
 
-Checked on 2026-09-20 with Rust 1.98.1 on an Apple M2 Pro, 16 GiB RAM,
+Checked on 2026-09-21 with Rust 1.98.1 on an Apple M2 Pro, 16 GiB RAM,
 macOS ARM64. Model downloads were verified against the SHA-256 values in
 `tests/fixtures/models.json`.
 
@@ -10,7 +10,7 @@ macOS ARM64. Model downloads were verified against the SHA-256 values in
 | --- | --- |
 | `cargo fmt --check` | Passed |
 | `cargo clippy --locked --all-targets -- -D warnings` | Passed |
-| `cargo test --locked` | 27 passed; 3 full-model tests ignored by default |
+| `cargo test --locked` | 31 passed; 4 model-dependent tests ignored by default |
 | `cargo test --release --test models -- --ignored --test-threads=1 --nocapture` | All 3 full-model tests passed |
 | `cargo build --locked --release` | Passed |
 | `cargo check --target x86_64-unknown-linux-gnu --all-targets` | Passed |
@@ -38,15 +38,18 @@ was `你好，世界。`, ending on the model's own EOS/EOT token.
 
 | Model | Relative L2 logit error | First-token top-10 overlap | Greedy output |
 | --- | ---: | ---: | --- |
-| 1.8B 1.25Bit | 0.006536 | 10/10 | Exact match |
-| 1.8B 2Bit | 0.017630 | 10/10 | Exact match |
-| 7B Q4_K_M | 0.022069 | 10/10 | Exact match |
+| 1.8B 1.25Bit | 0.007288 | 10/10 | Exact match |
+| 1.8B 2Bit | 0.019962 | 10/10 | Exact match |
+| 7B Q4_K_M | 0.021761 | 10/10 | Exact match |
 
-The independent CPU references quantize activations to Q8; Rust uses F32
-activations. Full-model tests therefore require relative L2 error below
-0.03, the same highest logit, and the same greedy output IDs. Decoder tests
-require exact F32 bit patterns and do not use this tolerance. Fixture source
-revisions are stored in `tests/fixtures/model_reference.json`.
+The independent CPU references quantize activations to Q8. Rust keeps F32
+activations for batched prefill and for its portable fallback kernels, and
+quantizes them to int8 in 256-element groups for the single-token GEMV path,
+which uses ARMv8.2 integer dot products where the CPU has them. Full-model
+tests therefore require relative L2 error below 0.03, the same highest
+logit, and the same greedy output IDs. Decoder tests require exact F32 bit
+patterns and do not use this tolerance. Fixture source revisions are stored
+in `tests/fixtures/model_reference.json`.
 
 No 30B model inference or benchmark was run. Per the requested memory limit,
 its validation is limited to source/header inspection, small MoE graph tests,
@@ -57,16 +60,17 @@ and the real chat-template fixtures. Its unfinished download was removed.
 These are single short translation runs with 8 CPU threads, a 512-token
 context limit, and greedy sampling. They ran on a shared desktop. Repeat
 with the target workload to assess performance. Rates below are per request;
-RSS is the maximum for the whole process.
+RSS is the maximum for the whole process. The 7B row varies most between
+runs, because a cold page cache changes its first-token latency.
 
 | Model | Concurrent requests | Mean first token (ms) | Mean decode tokens/s | Peak RSS (MiB) |
 | --- | ---: | ---: | ---: | ---: |
-| 1.8B 1.25Bit | 1 | 297.5 | 5.26 | 554.3 |
-| 1.8B 1.25Bit | 2 | 703.2 | 2.53 | 589.5 |
-| 1.8B 2Bit | 1 | 416.5 | 2.75 | 682.3 |
-| 1.8B 2Bit | 2 | 808.3 | 2.88 | 720.7 |
-| 7B Q4_K_M | 1 | 8139.0 | 0.14 | 2759.4 |
-| 7B Q4_K_M | 2 | 9680.8 | 0.10 | 2892.0 |
+| 1.8B 1.25Bit | 1 | 183.0 | 81.36 | 568.8 |
+| 1.8B 1.25Bit | 2 | 296.0 | 54.62 | 597.0 |
+| 1.8B 2Bit | 1 | 336.0 | 5.77 | 694.1 |
+| 1.8B 2Bit | 2 | 535.5 | 3.60 | 715.1 |
+| 7B Q4_K_M | 1 | 844.0 | 2.96 | 4586.8 |
+| 7B Q4_K_M | 2 | 1526.5 | 1.94 | 4676.1 |
 
 The 7B CPU path is slow on this machine. These measurements do not establish
 a throughput target. Weights remain packed, and concurrent requests share

@@ -6,8 +6,11 @@ GGUF models. It supports concurrent requests, streaming, and the official
 
 Inference and tokenization run in Rust. The CPU path uses packed, memory-mapped
 weights, bounded float scratch space, Candle CPU GEMM, and runtime-selected
-NEON/AVX2 dot products with a scalar fallback. The build disables native BLAS,
-GPU engines, Oniguruma, and the C++ tokenizer feature.
+NEON/AVX2 dot products with a scalar fallback. Single-token steps quantize the
+activations to int8 and multiply them with ARMv8.2 integer dot products where
+the CPU has them; batched prefill, AVX2, and scalar paths keep F32 activations.
+The build disables native BLAS, GPU engines, Oniguruma, and the C++ tokenizer
+feature.
 
 ## Build and run
 
@@ -135,7 +138,10 @@ thread pool. A slow streaming client does not occupy a CPU worker.
 ```
 
 Defaults are two active requests, eight queued requests, an 8,192-token
-context, and the available logical CPU count. KV caches use F32 and grow in
+context, and one CPU worker per performance core. On macOS the thread count is
+read from `hw.perflevel0` rather than every logical CPU, because the pool runs
+at user-interactive QoS and the scheduler places those threads on performance
+cores only. KV caches use F32 and grow in
 256-token chunks. At an 8,192-token context, the maximum KV cache per active
 request is 1 GiB for 1.8B, 2 GiB for 7B, and 1.5 GiB for 30B. Packed weights,
 tokenizer state, and working memory are additional. Startup logs show the
@@ -181,8 +187,10 @@ cargo test --release --test models -- --ignored --test-threads=1 --nocapture
 
 Set `HY_MT_MODELS` to use another model directory. The tests compare exact
 template text, prompt IDs, greedy token IDs, and next-token logits with pinned
-reference engines. Rust uses F32 activations; the quantized reference rounds
-activations to Q8, so logits use a documented numerical tolerance.
+reference engines. Rust keeps F32 activations for prefill and for its portable
+kernels, and quantizes them to int8 for the single-token GEMV path, while the
+quantized reference rounds activations to Q8, so logits use a documented
+numerical tolerance.
 
 30B inference and benchmarks are deferred on this 16 GiB development machine.
 Its MoE graph and template have small-fixture coverage. See

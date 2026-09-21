@@ -326,9 +326,15 @@ impl Model {
             check_cancel(cancel)?;
             let mut normalized = hidden.clone();
             rms_norm(&mut normalized, &layer.input_norm, self.config.rms_epsilon);
-            let mut q = layer.q.matmul(&normalized, batch)?;
-            let mut k = layer.k.matmul(&normalized, batch)?;
-            let v = layer.v.matmul(&normalized, batch)?;
+            let (mut q, mut k, v) = if batch == 1 {
+                Weight::gemv_qkv(&layer.q, &layer.k, &layer.v, &normalized)?
+            } else {
+                (
+                    layer.q.matmul(&normalized, batch)?,
+                    layer.k.matmul(&normalized, batch)?,
+                    layer.v.matmul(&normalized, batch)?,
+                )
+            };
             if self.config.architecture == Architecture::HyV3 {
                 rms_norm(&mut q, &layer.q_norm, self.config.rms_epsilon);
                 rms_norm(&mut k, &layer.k_norm, self.config.rms_epsilon);
