@@ -92,7 +92,7 @@ impl Weight {
         Ok(())
     }
 
-    fn bytes(&self) -> &[u8] {
+    pub fn bytes(&self) -> &[u8] {
         &self.data[self.info.offset..self.info.offset + self.info.byte_len]
     }
 
@@ -151,26 +151,26 @@ impl Weight {
             let chunk_size = (rows / target_chunks).clamp(32, 2048);
             match self.dtype() {
                 DType::STQ1_0 => {
+                    let all_bytes = self.bytes();
                     out.par_chunks_mut(chunk_size)
                         .enumerate()
                         .for_each(|(chunk_idx, chunk)| {
                             let base_row = chunk_idx * chunk_size;
-                            for (i, val) in chunk.iter_mut().enumerate() {
-                                let row = base_row + i;
-                                let bytes = &self.bytes()[row * row_bytes..(row + 1) * row_bytes];
-                                *val = stq_row_dot(bytes, input);
+                            let chunk_bytes = &all_bytes[base_row * row_bytes..(base_row + chunk.len()) * row_bytes];
+                            for (val, row_b) in chunk.iter_mut().zip(chunk_bytes.chunks_exact(row_bytes)) {
+                                *val = stq_row_dot(row_b, input);
                             }
                         });
                 }
                 DType::Q6_K => {
+                    let all_bytes = self.bytes();
                     out.par_chunks_mut(chunk_size)
                         .enumerate()
                         .for_each(|(chunk_idx, chunk)| {
                             let base_row = chunk_idx * chunk_size;
-                            for (i, val) in chunk.iter_mut().enumerate() {
-                                let row = base_row + i;
-                                let bytes = &self.bytes()[row * row_bytes..(row + 1) * row_bytes];
-                                *val = q6_row_dot(bytes, input);
+                            let chunk_bytes = &all_bytes[base_row * row_bytes..(base_row + chunk.len()) * row_bytes];
+                            for (val, row_b) in chunk.iter_mut().zip(chunk_bytes.chunks_exact(row_bytes)) {
+                                *val = q6_row_dot(row_b, input);
                             }
                         });
                 }
@@ -219,13 +219,14 @@ impl Weight {
             let xs = Tensor::from_slice(input, (batch, cols), &Device::Cpu)?
                 .t()?
                 .contiguous()?;
+            let tile_rows = 128;
             transposed
-                .par_chunks_mut(32 * batch)
+                .par_chunks_mut(tile_rows * batch)
                 .enumerate()
                 .try_for_each(|(tile, output)| -> Result<()> {
                     let nrows = output.len() / batch;
                     let mut w = vec![0.; nrows * cols];
-                    let start = tile * 32 * row_bytes;
+                    let start = tile * tile_rows * row_bytes;
                     decode(
                         self.dtype(),
                         &self.bytes()[start..start + nrows * row_bytes],
@@ -280,16 +281,20 @@ impl Weight {
 
         match (self.dtype(), up.dtype()) {
             (DType::STQ1_0, DType::STQ1_0) => {
+                let self_bytes = self.bytes();
+                let up_bytes = up.bytes();
                 out.par_chunks_mut(chunk_size)
                     .enumerate()
                     .for_each(|(chunk_idx, chunk)| {
                         let base_row = chunk_idx * chunk_size;
-                        for (i, val) in chunk.iter_mut().enumerate() {
-                            let row = base_row + i;
-                            let g_bytes = &self.bytes()[row * row_bytes..(row + 1) * row_bytes];
-                            let u_bytes = &up.bytes()[row * row_bytes..(row + 1) * row_bytes];
-                            let g = stq_row_dot(g_bytes, input);
-                            let u = stq_row_dot(u_bytes, input);
+                        let self_chunk = &self_bytes[base_row * row_bytes..(base_row + chunk.len()) * row_bytes];
+                        let up_chunk = &up_bytes[base_row * row_bytes..(base_row + chunk.len()) * row_bytes];
+                        for ((val, g_b), u_b) in chunk.iter_mut()
+                            .zip(self_chunk.chunks_exact(row_bytes))
+                            .zip(up_chunk.chunks_exact(row_bytes))
+                        {
+                            let g = stq_row_dot(g_b, input);
+                            let u = stq_row_dot(u_b, input);
                             let silu = g / (1.0 + (-g).exp());
                             *val = silu * u;
                         }
@@ -404,11 +409,11 @@ unsafe fn stq_digits_neon(bytes: &[u8], scale: f32, out: &mut [f32]) {
             vld1q_u8(STQ_CODEBOOK.as_ptr()),
             vld1q_u8(STQ_CODEBOOK.as_ptr().add(16)),
         );
-        let shifts: [i8; 8] = [0, -1, -2, -3, -4, -5, -6, -7];
-        let shifts = vld1_s8(shifts.as_ptr());
+        let sign_shifts: [i8; 16] = [4, 3, 2, 1, 0, -1, -2, -3, 4, 3, 2, 1, 0, -1, -2, -3];
+        let sign_shifts = vld1q_s8(sign_shifts.as_ptr());
         let one = vdupq_n_u8(1);
         let mask15 = vdup_n_u8(15);
-        let mask1 = vdupq_n_u8(1);
+        let mask16 = vdupq_n_u8(0x10);
         let mask3 = vdupq_n_u8(3);
         let scale_vec = vdupq_n_f32(scale);
         let out_ptr = out.as_mut_ptr();
@@ -418,46 +423,48 @@ unsafe fn stq_digits_neon(bytes: &[u8], scale: f32, out: &mut [f32]) {
             let lo = vand_u8(cw, mask15);
             let hi = vshr_n_u8(cw, 4);
             let codes = vcombine_u8(vzip1_u8(lo, hi), vzip2_u8(lo, hi));
-            let s0 = vshl_u8(vdup_n_u8(bytes[32 + 2 * c]), shifts);
-            let s1 = vshl_u8(vdup_n_u8(bytes[33 + 2 * c]), shifts);
-            let signs = vshlq_n_u8(vandq_u8(vcombine_u8(s0, s1), mask1), 4);
+            let b01 = vcombine_u8(
+                vdup_n_u8(*bytes.as_ptr().add(32 + 2 * c)),
+                vdup_n_u8(*bytes.as_ptr().add(33 + 2 * c)),
+            );
+            let signs = vandq_u8(vshlq_u8(b01, sign_shifts), mask16);
             let packed = vqtbl2q_u8(cbs, vorrq_u8(codes, signs));
 
             let t8_0 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(packed, mask3), one));
             let lo8_0 = vmovl_s8(vget_low_s8(t8_0));
-            let hi8_0 = vmovl_s8(vget_high_s8(t8_0));
+            let hi8_0 = vmovl_high_s8(t8_0);
             let dst0 = out_ptr.add(c * 64);
             vst1q_f32(dst0, vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_0))), scale_vec));
-            vst1q_f32(dst0.add(4), vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo8_0))), scale_vec));
+            vst1q_f32(dst0.add(4), vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(lo8_0)), scale_vec));
             vst1q_f32(dst0.add(8), vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_0))), scale_vec));
-            vst1q_f32(dst0.add(12), vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi8_0))), scale_vec));
+            vst1q_f32(dst0.add(12), vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(hi8_0)), scale_vec));
 
             let t8_1 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(vshrq_n_u8(packed, 2), mask3), one));
             let lo8_1 = vmovl_s8(vget_low_s8(t8_1));
-            let hi8_1 = vmovl_s8(vget_high_s8(t8_1));
+            let hi8_1 = vmovl_high_s8(t8_1);
             let dst1 = dst0.add(16);
             vst1q_f32(dst1, vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_1))), scale_vec));
-            vst1q_f32(dst1.add(4), vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo8_1))), scale_vec));
+            vst1q_f32(dst1.add(4), vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(lo8_1)), scale_vec));
             vst1q_f32(dst1.add(8), vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_1))), scale_vec));
-            vst1q_f32(dst1.add(12), vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi8_1))), scale_vec));
+            vst1q_f32(dst1.add(12), vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(hi8_1)), scale_vec));
 
             let t8_2 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(vshrq_n_u8(packed, 4), mask3), one));
             let lo8_2 = vmovl_s8(vget_low_s8(t8_2));
-            let hi8_2 = vmovl_s8(vget_high_s8(t8_2));
+            let hi8_2 = vmovl_high_s8(t8_2);
             let dst2 = dst0.add(32);
             vst1q_f32(dst2, vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_2))), scale_vec));
-            vst1q_f32(dst2.add(4), vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo8_2))), scale_vec));
+            vst1q_f32(dst2.add(4), vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(lo8_2)), scale_vec));
             vst1q_f32(dst2.add(8), vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_2))), scale_vec));
-            vst1q_f32(dst2.add(12), vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi8_2))), scale_vec));
+            vst1q_f32(dst2.add(12), vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(hi8_2)), scale_vec));
 
             let t8_3 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(vshrq_n_u8(packed, 6), mask3), one));
             let lo8_3 = vmovl_s8(vget_low_s8(t8_3));
-            let hi8_3 = vmovl_s8(vget_high_s8(t8_3));
+            let hi8_3 = vmovl_high_s8(t8_3);
             let dst3 = dst0.add(48);
             vst1q_f32(dst3, vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_3))), scale_vec));
-            vst1q_f32(dst3.add(4), vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo8_3))), scale_vec));
+            vst1q_f32(dst3.add(4), vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(lo8_3)), scale_vec));
             vst1q_f32(dst3.add(8), vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_3))), scale_vec));
-            vst1q_f32(dst3.add(12), vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi8_3))), scale_vec));
+            vst1q_f32(dst3.add(12), vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(hi8_3)), scale_vec));
         }
     }
 }
@@ -513,9 +520,12 @@ unsafe fn stq_row_dot_neon(row_bytes: &[u8], x: &[f32]) -> f32 {
             vld1q_u8(STQ_CODEBOOK.as_ptr()),
             vld1q_u8(STQ_CODEBOOK.as_ptr().add(16)),
         );
-        let shifts: [i8; 8] = [0, -1, -2, -3, -4, -5, -6, -7];
-        let shifts = vld1_s8(shifts.as_ptr());
+        let sign_shifts: [i8; 16] = [4, 3, 2, 1, 0, -1, -2, -3, 4, 3, 2, 1, 0, -1, -2, -3];
+        let sign_shifts = vld1q_s8(sign_shifts.as_ptr());
         let one = vdupq_n_u8(1);
+        let mask15 = vdup_n_u8(15);
+        let mask16 = vdupq_n_u8(0x10);
+        let mask3 = vdupq_n_u8(3);
         let mut row_acc = vdupq_n_f32(0.);
 
         let num_blocks = row_bytes.len() / 42;
@@ -523,7 +533,7 @@ unsafe fn stq_row_dot_neon(row_bytes: &[u8], x: &[f32]) -> f32 {
         let mut x_ptr = x.as_ptr();
 
         for _ in 0..num_blocks {
-            let d = half(std::slice::from_raw_parts(bytes_ptr.add(40), 2));
+            let d = half_raw(bytes_ptr.add(40));
             let mut a0 = vdupq_n_f32(0.);
             let mut a1 = vdupq_n_f32(0.);
             let mut a2 = vdupq_n_f32(0.);
@@ -531,52 +541,51 @@ unsafe fn stq_row_dot_neon(row_bytes: &[u8], x: &[f32]) -> f32 {
 
             for c in 0..4usize {
                 let cw = vld1_u8(bytes_ptr.add(8 * c));
-                let lo = vand_u8(cw, vdup_n_u8(15));
+                let lo = vand_u8(cw, mask15);
                 let hi = vshr_n_u8(cw, 4);
                 let codes = vcombine_u8(vzip1_u8(lo, hi), vzip2_u8(lo, hi));
-                let s0 = vshl_u8(vdup_n_u8(*bytes_ptr.add(32 + 2 * c)), shifts);
-                let s1 = vshl_u8(vdup_n_u8(*bytes_ptr.add(33 + 2 * c)), shifts);
-                let signs = vcombine_u8(
-                    vshl_n_u8(vand_u8(s0, vdup_n_u8(1)), 4),
-                    vshl_n_u8(vand_u8(s1, vdup_n_u8(1)), 4),
+                let b01 = vcombine_u8(
+                    vdup_n_u8(*bytes_ptr.add(32 + 2 * c)),
+                    vdup_n_u8(*bytes_ptr.add(33 + 2 * c)),
                 );
+                let signs = vandq_u8(vshlq_u8(b01, sign_shifts), mask16);
                 let packed = vqtbl2q_u8(cbs, vorrq_u8(codes, signs));
 
-                let t8_0 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(packed, vdupq_n_u8(3)), one));
+                let t8_0 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(packed, mask3), one));
                 let lo8_0 = vmovl_s8(vget_low_s8(t8_0));
-                let hi8_0 = vmovl_s8(vget_high_s8(t8_0));
+                let hi8_0 = vmovl_high_s8(t8_0);
                 let xs0 = x_ptr.add(c * 64);
                 a0 = vfmaq_f32(a0, vld1q_f32(xs0), vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_0))));
-                a1 = vfmaq_f32(a1, vld1q_f32(xs0.add(4)), vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo8_0))));
+                a1 = vfmaq_f32(a1, vld1q_f32(xs0.add(4)), vcvtq_f32_s32(vmovl_high_s16(lo8_0)));
                 a2 = vfmaq_f32(a2, vld1q_f32(xs0.add(8)), vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_0))));
-                a3 = vfmaq_f32(a3, vld1q_f32(xs0.add(12)), vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi8_0))));
+                a3 = vfmaq_f32(a3, vld1q_f32(xs0.add(12)), vcvtq_f32_s32(vmovl_high_s16(hi8_0)));
 
-                let t8_1 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(vshrq_n_u8(packed, 2), vdupq_n_u8(3)), one));
+                let t8_1 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(vshrq_n_u8(packed, 2), mask3), one));
                 let lo8_1 = vmovl_s8(vget_low_s8(t8_1));
-                let hi8_1 = vmovl_s8(vget_high_s8(t8_1));
+                let hi8_1 = vmovl_high_s8(t8_1);
                 let xs1 = xs0.add(16);
                 a0 = vfmaq_f32(a0, vld1q_f32(xs1), vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_1))));
-                a1 = vfmaq_f32(a1, vld1q_f32(xs1.add(4)), vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo8_1))));
+                a1 = vfmaq_f32(a1, vld1q_f32(xs1.add(4)), vcvtq_f32_s32(vmovl_high_s16(lo8_1)));
                 a2 = vfmaq_f32(a2, vld1q_f32(xs1.add(8)), vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_1))));
-                a3 = vfmaq_f32(a3, vld1q_f32(xs1.add(12)), vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi8_1))));
+                a3 = vfmaq_f32(a3, vld1q_f32(xs1.add(12)), vcvtq_f32_s32(vmovl_high_s16(hi8_1)));
 
-                let t8_2 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(vshrq_n_u8(packed, 4), vdupq_n_u8(3)), one));
+                let t8_2 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(vshrq_n_u8(packed, 4), mask3), one));
                 let lo8_2 = vmovl_s8(vget_low_s8(t8_2));
-                let hi8_2 = vmovl_s8(vget_high_s8(t8_2));
+                let hi8_2 = vmovl_high_s8(t8_2);
                 let xs2 = xs0.add(32);
                 a0 = vfmaq_f32(a0, vld1q_f32(xs2), vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_2))));
-                a1 = vfmaq_f32(a1, vld1q_f32(xs2.add(4)), vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo8_2))));
+                a1 = vfmaq_f32(a1, vld1q_f32(xs2.add(4)), vcvtq_f32_s32(vmovl_high_s16(lo8_2)));
                 a2 = vfmaq_f32(a2, vld1q_f32(xs2.add(8)), vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_2))));
-                a3 = vfmaq_f32(a3, vld1q_f32(xs2.add(12)), vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi8_2))));
+                a3 = vfmaq_f32(a3, vld1q_f32(xs2.add(12)), vcvtq_f32_s32(vmovl_high_s16(hi8_2)));
 
-                let t8_3 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(vshrq_n_u8(packed, 6), vdupq_n_u8(3)), one));
+                let t8_3 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(vshrq_n_u8(packed, 6), mask3), one));
                 let lo8_3 = vmovl_s8(vget_low_s8(t8_3));
-                let hi8_3 = vmovl_s8(vget_high_s8(t8_3));
+                let hi8_3 = vmovl_high_s8(t8_3);
                 let xs3 = xs0.add(48);
                 a0 = vfmaq_f32(a0, vld1q_f32(xs3), vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_3))));
-                a1 = vfmaq_f32(a1, vld1q_f32(xs3.add(4)), vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo8_3))));
+                a1 = vfmaq_f32(a1, vld1q_f32(xs3.add(4)), vcvtq_f32_s32(vmovl_high_s16(lo8_3)));
                 a2 = vfmaq_f32(a2, vld1q_f32(xs3.add(8)), vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_3))));
-                a3 = vfmaq_f32(a3, vld1q_f32(xs3.add(12)), vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi8_3))));
+                a3 = vfmaq_f32(a3, vld1q_f32(xs3.add(12)), vcvtq_f32_s32(vmovl_high_s16(hi8_3)));
             }
 
             let block_sum = vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3));
@@ -589,6 +598,8 @@ unsafe fn stq_row_dot_neon(row_bytes: &[u8], x: &[f32]) -> f32 {
         vaddvq_f32(row_acc)
     }
 }
+
+
 /// Fused NEON kernel: gathers codebook bytes with a 32-entry table lookup,
 /// extracts each 2-bit lane, and FMA-accumulates against the activations.
 #[cfg(target_arch = "aarch64")]
@@ -602,9 +613,12 @@ unsafe fn stq_dot_neon(bytes: &[u8], x: &[f32]) -> f32 {
             vld1q_u8(STQ_CODEBOOK.as_ptr()),
             vld1q_u8(STQ_CODEBOOK.as_ptr().add(16)),
         );
-        let shifts: [i8; 8] = [0, -1, -2, -3, -4, -5, -6, -7];
-        let shifts = vld1_s8(shifts.as_ptr());
+        let sign_shifts: [i8; 16] = [4, 3, 2, 1, 0, -1, -2, -3, 4, 3, 2, 1, 0, -1, -2, -3];
+        let sign_shifts = vld1q_s8(sign_shifts.as_ptr());
         let one = vdupq_n_u8(1);
+        let mask15 = vdup_n_u8(15);
+        let mask16 = vdupq_n_u8(0x10);
+        let mask3 = vdupq_n_u8(3);
         let (mut a0, mut a1, mut a2, mut a3) = (
             vdupq_n_f32(0.),
             vdupq_n_f32(0.),
@@ -612,51 +626,52 @@ unsafe fn stq_dot_neon(bytes: &[u8], x: &[f32]) -> f32 {
             vdupq_n_f32(0.),
         );
         for c in 0..4usize {
-            // 16 five-bit (sign, code) indices for this chunk of 16 groups.
             let cw = vld1_u8(bytes.as_ptr().add(8 * c));
-            let lo = vand_u8(cw, vdup_n_u8(15));
+            let lo = vand_u8(cw, mask15);
             let hi = vshr_n_u8(cw, 4);
             let codes = vcombine_u8(vzip1_u8(lo, hi), vzip2_u8(lo, hi));
-            let s0 = vshl_u8(vdup_n_u8(bytes[32 + 2 * c]), shifts);
-            let s1 = vshl_u8(vdup_n_u8(bytes[33 + 2 * c]), shifts);
-            let signs = vcombine_u8(
-                vshl_n_u8(vand_u8(s0, vdup_n_u8(1)), 4),
-                vshl_n_u8(vand_u8(s1, vdup_n_u8(1)), 4),
+            let b01 = vcombine_u8(
+                vdup_n_u8(*bytes.as_ptr().add(32 + 2 * c)),
+                vdup_n_u8(*bytes.as_ptr().add(33 + 2 * c)),
             );
+            let signs = vandq_u8(vshlq_u8(b01, sign_shifts), mask16);
             let packed = vqtbl2q_u8(cbs, vorrq_u8(codes, signs));
-            for p in 0..4usize {
-                // Lane p of every codebook byte, minus one: ±1/0 per weight.
-                let shifted = match p {
-                    0 => packed,
-                    1 => vshrq_n_u8(packed, 2),
-                    2 => vshrq_n_u8(packed, 4),
-                    _ => vshrq_n_u8(packed, 6),
-                };
-                let t8 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(shifted, vdupq_n_u8(3)), one));
-                let lo8 = vmovl_s8(vget_low_s8(t8));
-                let hi8 = vmovl_s8(vget_high_s8(t8));
-                let xs = x.as_ptr().add(c * 64 + p * 16);
-                a0 = vfmaq_f32(
-                    a0,
-                    vld1q_f32(xs),
-                    vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8))),
-                );
-                a1 = vfmaq_f32(
-                    a1,
-                    vld1q_f32(xs.add(4)),
-                    vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo8))),
-                );
-                a2 = vfmaq_f32(
-                    a2,
-                    vld1q_f32(xs.add(8)),
-                    vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8))),
-                );
-                a3 = vfmaq_f32(
-                    a3,
-                    vld1q_f32(xs.add(12)),
-                    vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi8))),
-                );
-            }
+
+            let t8_0 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(packed, mask3), one));
+            let lo8_0 = vmovl_s8(vget_low_s8(t8_0));
+            let hi8_0 = vmovl_high_s8(t8_0);
+            let xs0 = x.as_ptr().add(c * 64);
+            a0 = vfmaq_f32(a0, vld1q_f32(xs0), vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_0))));
+            a1 = vfmaq_f32(a1, vld1q_f32(xs0.add(4)), vcvtq_f32_s32(vmovl_high_s16(lo8_0)));
+            a2 = vfmaq_f32(a2, vld1q_f32(xs0.add(8)), vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_0))));
+            a3 = vfmaq_f32(a3, vld1q_f32(xs0.add(12)), vcvtq_f32_s32(vmovl_high_s16(hi8_0)));
+
+            let t8_1 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(vshrq_n_u8(packed, 2), mask3), one));
+            let lo8_1 = vmovl_s8(vget_low_s8(t8_1));
+            let hi8_1 = vmovl_high_s8(t8_1);
+            let xs1 = xs0.add(16);
+            a0 = vfmaq_f32(a0, vld1q_f32(xs1), vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_1))));
+            a1 = vfmaq_f32(a1, vld1q_f32(xs1.add(4)), vcvtq_f32_s32(vmovl_high_s16(lo8_1)));
+            a2 = vfmaq_f32(a2, vld1q_f32(xs1.add(8)), vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_1))));
+            a3 = vfmaq_f32(a3, vld1q_f32(xs1.add(12)), vcvtq_f32_s32(vmovl_high_s16(hi8_1)));
+
+            let t8_2 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(vshrq_n_u8(packed, 4), mask3), one));
+            let lo8_2 = vmovl_s8(vget_low_s8(t8_2));
+            let hi8_2 = vmovl_high_s8(t8_2);
+            let xs2 = xs0.add(32);
+            a0 = vfmaq_f32(a0, vld1q_f32(xs2), vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_2))));
+            a1 = vfmaq_f32(a1, vld1q_f32(xs2.add(4)), vcvtq_f32_s32(vmovl_high_s16(lo8_2)));
+            a2 = vfmaq_f32(a2, vld1q_f32(xs2.add(8)), vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_2))));
+            a3 = vfmaq_f32(a3, vld1q_f32(xs2.add(12)), vcvtq_f32_s32(vmovl_high_s16(hi8_2)));
+
+            let t8_3 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(vshrq_n_u8(packed, 6), mask3), one));
+            let lo8_3 = vmovl_s8(vget_low_s8(t8_3));
+            let hi8_3 = vmovl_high_s8(t8_3);
+            let xs3 = xs0.add(48);
+            a0 = vfmaq_f32(a0, vld1q_f32(xs3), vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo8_3))));
+            a1 = vfmaq_f32(a1, vld1q_f32(xs3.add(4)), vcvtq_f32_s32(vmovl_high_s16(lo8_3)));
+            a2 = vfmaq_f32(a2, vld1q_f32(xs3.add(8)), vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi8_3))));
+            a3 = vfmaq_f32(a3, vld1q_f32(xs3.add(12)), vcvtq_f32_s32(vmovl_high_s16(hi8_3)));
         }
         vaddvq_f32(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)))
     }
@@ -712,6 +727,9 @@ unsafe fn q6_row_dot_neon(row_bytes: &[u8], x: &[f32]) -> f32 {
             vdupq_n_f32(0.),
             vdupq_n_f32(0.),
         );
+        let mask15 = vdupq_n_u8(15);
+        let mask3 = vdupq_n_u8(3);
+        let c32 = vdupq_n_u8(32);
         let num_blocks = row_bytes.len() / 210;
         let mut bytes_ptr = row_bytes.as_ptr();
         let mut x_ptr = x.as_ptr();
@@ -727,8 +745,8 @@ unsafe fn q6_row_dot_neon(row_bytes: &[u8], x: &[f32]) -> f32 {
                         let qlv = vld1q_u8(ql.add((p & 1) * 32 + h * 16));
                         let qhv = vld1q_u8(qh.add(h * 16));
                         let lo6 = match p {
-                            2 | 3 => vandq_u8(vshrq_n_u8(qlv, 4), vdupq_n_u8(15)),
-                            _ => vandq_u8(qlv, vdupq_n_u8(15)),
+                            2 | 3 => vandq_u8(vshrq_n_u8(qlv, 4), mask15),
+                            _ => vandq_u8(qlv, mask15),
                         };
                         let bits = match p {
                             0 => qhv,
@@ -736,11 +754,11 @@ unsafe fn q6_row_dot_neon(row_bytes: &[u8], x: &[f32]) -> f32 {
                             2 => vshrq_n_u8(qhv, 4),
                             _ => vshrq_n_u8(qhv, 6),
                         };
-                        let q6 = vorrq_u8(lo6, vshlq_n_u8(vandq_u8(bits, vdupq_n_u8(3)), 4));
-                        let t8 = vreinterpretq_s8_u8(vsubq_u8(q6, vdupq_n_u8(32)));
+                        let q6 = vorrq_u8(lo6, vshlq_n_u8(vandq_u8(bits, mask3), 4));
+                        let t8 = vreinterpretq_s8_u8(vsubq_u8(q6, c32));
                         let s = vdupq_n_f32(d * (*sc.add(2 * p + h) as i8) as f32);
                         let lo8 = vmovl_s8(vget_low_s8(t8));
-                        let hi8 = vmovl_s8(vget_high_s8(t8));
+                        let hi8 = vmovl_high_s8(t8);
                         let base = x_ptr.add(c * 128 + p * 32 + h * 16);
                         a0 = vfmaq_f32(
                             a0,
@@ -749,7 +767,7 @@ unsafe fn q6_row_dot_neon(row_bytes: &[u8], x: &[f32]) -> f32 {
                         );
                         a1 = vfmaq_f32(
                             a1,
-                            vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo8))), s),
+                            vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(lo8)), s),
                             vld1q_f32(base.add(4)),
                         );
                         a2 = vfmaq_f32(
@@ -759,7 +777,7 @@ unsafe fn q6_row_dot_neon(row_bytes: &[u8], x: &[f32]) -> f32 {
                         );
                         a3 = vfmaq_f32(
                             a3,
-                            vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi8))), s),
+                            vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(hi8)), s),
                             vld1q_f32(base.add(12)),
                         );
                     }
@@ -962,15 +980,17 @@ unsafe fn dot_neon(a: &[f32], b: &[f32]) -> f32 {
         vdupq_n_f32(0.),
     );
     let chunks = a.len() / 16;
-    let (ap, bp) = (a.as_ptr(), b.as_ptr());
-    for i in 0..chunks {
-        let i = i * 16;
+    let mut ap = a.as_ptr();
+    let mut bp = b.as_ptr();
+    for _ in 0..chunks {
         // SAFETY: all sixteen-element loads stay within the equal-length slices.
         unsafe {
-            s0 = vfmaq_f32(s0, vld1q_f32(ap.add(i)), vld1q_f32(bp.add(i)));
-            s1 = vfmaq_f32(s1, vld1q_f32(ap.add(i + 4)), vld1q_f32(bp.add(i + 4)));
-            s2 = vfmaq_f32(s2, vld1q_f32(ap.add(i + 8)), vld1q_f32(bp.add(i + 8)));
-            s3 = vfmaq_f32(s3, vld1q_f32(ap.add(i + 12)), vld1q_f32(bp.add(i + 12)));
+            s0 = vfmaq_f32(s0, vld1q_f32(ap), vld1q_f32(bp));
+            s1 = vfmaq_f32(s1, vld1q_f32(ap.add(4)), vld1q_f32(bp.add(4)));
+            s2 = vfmaq_f32(s2, vld1q_f32(ap.add(8)), vld1q_f32(bp.add(8)));
+            s3 = vfmaq_f32(s3, vld1q_f32(ap.add(12)), vld1q_f32(bp.add(12)));
+            ap = ap.add(16);
+            bp = bp.add(16);
         }
     }
     let mut sum = vaddq_f32(vaddq_f32(s0, s1), vaddq_f32(s2, s3));
@@ -979,7 +999,7 @@ unsafe fn dot_neon(a: &[f32], b: &[f32]) -> f32 {
     for i in (simd_end..vec_end).step_by(4) {
         // SAFETY: the four-element loads are within the equal-length slices.
         unsafe {
-            sum = vfmaq_f32(sum, vld1q_f32(ap.add(i)), vld1q_f32(bp.add(i)));
+            sum = vfmaq_f32(sum, vld1q_f32(a.as_ptr().add(i)), vld1q_f32(b.as_ptr().add(i)));
         }
     }
     vaddvq_f32(sum) + dot_scalar(&a[vec_end..], &b[vec_end..])

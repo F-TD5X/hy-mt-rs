@@ -537,9 +537,41 @@ fn norm(g: &Gguf, name: &str, len: usize) -> Result<Vec<f32>> {
 }
 
 fn rms_norm(values: &mut [f32], weights: &[f32], epsilon: f32) {
-    for row in values.chunks_exact_mut(weights.len()) {
+    let w_len = weights.len();
+    for row in values.chunks_exact_mut(w_len) {
         let variance = dot(row, row) / row.len() as f32;
         let scale = (variance + epsilon).sqrt().recip();
+        #[cfg(target_arch = "aarch64")]
+        {
+            use std::arch::aarch64::*;
+            let scale_vec = unsafe { vdupq_n_f32(scale) };
+            let chunks = w_len / 16;
+            let mut rp = row.as_mut_ptr();
+            let mut wp = weights.as_ptr();
+            unsafe {
+                for _ in 0..chunks {
+                    let r0 = vld1q_f32(rp);
+                    let r1 = vld1q_f32(rp.add(4));
+                    let r2 = vld1q_f32(rp.add(8));
+                    let r3 = vld1q_f32(rp.add(12));
+                    let w0 = vld1q_f32(wp);
+                    let w1 = vld1q_f32(wp.add(4));
+                    let w2 = vld1q_f32(wp.add(8));
+                    let w3 = vld1q_f32(wp.add(12));
+                    vst1q_f32(rp, vmulq_f32(r0, vmulq_f32(w0, scale_vec)));
+                    vst1q_f32(rp.add(4), vmulq_f32(r1, vmulq_f32(w1, scale_vec)));
+                    vst1q_f32(rp.add(8), vmulq_f32(r2, vmulq_f32(w2, scale_vec)));
+                    vst1q_f32(rp.add(12), vmulq_f32(r3, vmulq_f32(w3, scale_vec)));
+                    rp = rp.add(16);
+                    wp = wp.add(16);
+                }
+            }
+            for (x, &weight) in row[chunks * 16..].iter_mut().zip(&weights[chunks * 16..]) {
+                *x = *x * scale * weight;
+            }
+            continue;
+        }
+        #[cfg(not(target_arch = "aarch64"))]
         for (x, &weight) in row.iter_mut().zip(weights) {
             *x = *x * scale * weight;
         }
@@ -547,13 +579,70 @@ fn rms_norm(values: &mut [f32], weights: &[f32], epsilon: f32) {
 }
 
 fn rope(values: &mut [f32], heads: usize, dim: usize, start: usize, frequencies: &[f32]) {
+    let half_dim = dim / 2;
     for (token, row) in values.chunks_exact_mut(heads * dim).enumerate() {
-        for head in row.chunks_exact_mut(dim) {
+        let pos = (start + token) as f32;
+        let mut cos_buf = [0f32; 64];
+        let mut sin_buf = [0f32; 64];
+        let mut cos_vec;
+        let mut sin_vec;
+        let (cos_s, sin_s): (&[f32], &[f32]) = if half_dim <= 64 {
             for (j, &freq) in frequencies.iter().enumerate() {
-                let (sin, cos) = ((start + token) as f32 * freq).sin_cos();
-                let (a, b) = (head[j], head[j + dim / 2]);
-                head[j] = a * cos - b * sin;
-                head[j + dim / 2] = a * sin + b * cos;
+                let (s, c) = (pos * freq).sin_cos();
+                sin_buf[j] = s;
+                cos_buf[j] = c;
+            }
+            (&cos_buf[..half_dim], &sin_buf[..half_dim])
+        } else {
+            cos_vec = Vec::with_capacity(half_dim);
+            sin_vec = Vec::with_capacity(half_dim);
+            for &freq in frequencies {
+                let (s, c) = (pos * freq).sin_cos();
+                sin_vec.push(s);
+                cos_vec.push(c);
+            }
+            (&cos_vec[..], &sin_vec[..])
+        };
+
+        for head in row.chunks_exact_mut(dim) {
+            #[cfg(target_arch = "aarch64")]
+            {
+                use std::arch::aarch64::*;
+                let chunks = half_dim / 4;
+                let mut ap = head.as_mut_ptr();
+                let mut bp = unsafe { ap.add(half_dim) };
+                let mut cp = cos_s.as_ptr();
+                let mut sp = sin_s.as_ptr();
+                unsafe {
+                    for _ in 0..chunks {
+                        let a = vld1q_f32(ap);
+                        let b = vld1q_f32(bp);
+                        let c = vld1q_f32(cp);
+                        let s = vld1q_f32(sp);
+                        let ac = vmulq_f32(a, c);
+                        let bs = vmulq_f32(b, s);
+                        let as_val = vmulq_f32(a, s);
+                        let bc = vmulq_f32(b, c);
+                        vst1q_f32(ap, vsubq_f32(ac, bs));
+                        vst1q_f32(bp, vaddq_f32(as_val, bc));
+                        ap = ap.add(4);
+                        bp = bp.add(4);
+                        cp = cp.add(4);
+                        sp = sp.add(4);
+                    }
+                }
+                for j in (chunks * 4)..half_dim {
+                    let (a, b) = (head[j], head[j + half_dim]);
+                    head[j] = a * cos_s[j] - b * sin_s[j];
+                    head[j + half_dim] = a * sin_s[j] + b * cos_s[j];
+                }
+                continue;
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            for j in 0..half_dim {
+                let (a, b) = (head[j], head[j + half_dim]);
+                head[j] = a * cos_s[j] - b * sin_s[j];
+                head[j + half_dim] = a * sin_s[j] + b * cos_s[j];
             }
         }
     }
@@ -594,7 +683,39 @@ fn attention(q: &[f32], cache: &KvCache, config: &Config, past: usize) -> Vec<f3
             for (pos, &score) in scores.iter().enumerate() {
                 let offset = pos * kv_width + kv_head * dim;
                 let p = score * inv_sum;
-                for (out_val, &val) in output.iter_mut().zip(&cache.values[offset..offset + dim]) {
+                let val_slice = &cache.values[offset..offset + dim];
+                #[cfg(target_arch = "aarch64")]
+                {
+                    use std::arch::aarch64::*;
+                    let pv = unsafe { vdupq_n_f32(p) };
+                    let chunks = dim / 16;
+                    let mut op = output.as_mut_ptr();
+                    let mut vp = val_slice.as_ptr();
+                    unsafe {
+                        for _ in 0..chunks {
+                            let o0 = vld1q_f32(op);
+                            let o1 = vld1q_f32(op.add(4));
+                            let o2 = vld1q_f32(op.add(8));
+                            let o3 = vld1q_f32(op.add(12));
+                            let v0 = vld1q_f32(vp);
+                            let v1 = vld1q_f32(vp.add(4));
+                            let v2 = vld1q_f32(vp.add(8));
+                            let v3 = vld1q_f32(vp.add(12));
+                            vst1q_f32(op, vfmaq_f32(o0, v0, pv));
+                            vst1q_f32(op.add(4), vfmaq_f32(o1, v1, pv));
+                            vst1q_f32(op.add(8), vfmaq_f32(o2, v2, pv));
+                            vst1q_f32(op.add(12), vfmaq_f32(o3, v3, pv));
+                            op = op.add(16);
+                            vp = vp.add(16);
+                        }
+                    }
+                    for (out_val, &val) in output[chunks * 16..].iter_mut().zip(&val_slice[chunks * 16..]) {
+                        *out_val += p * val;
+                    }
+                    continue;
+                }
+                #[cfg(not(target_arch = "aarch64"))]
+                for (out_val, &val) in output.iter_mut().zip(val_slice) {
                     *out_val += p * val;
                 }
             }
@@ -603,6 +724,37 @@ fn attention(q: &[f32], cache: &KvCache, config: &Config, past: usize) -> Vec<f3
 }
 
 fn add(dst: &mut [f32], src: &[f32]) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        use std::arch::aarch64::*;
+        let len = dst.len();
+        let chunks = len / 16;
+        let mut dp = dst.as_mut_ptr();
+        let mut sp = src.as_ptr();
+        unsafe {
+            for _ in 0..chunks {
+                let d0 = vld1q_f32(dp);
+                let d1 = vld1q_f32(dp.add(4));
+                let d2 = vld1q_f32(dp.add(8));
+                let d3 = vld1q_f32(dp.add(12));
+                let s0 = vld1q_f32(sp);
+                let s1 = vld1q_f32(sp.add(4));
+                let s2 = vld1q_f32(sp.add(8));
+                let s3 = vld1q_f32(sp.add(12));
+                vst1q_f32(dp, vaddq_f32(d0, s0));
+                vst1q_f32(dp.add(4), vaddq_f32(d1, s1));
+                vst1q_f32(dp.add(8), vaddq_f32(d2, s2));
+                vst1q_f32(dp.add(12), vaddq_f32(d3, s3));
+                dp = dp.add(16);
+                sp = sp.add(16);
+            }
+        }
+        for (x, y) in dst[chunks * 16..].iter_mut().zip(&src[chunks * 16..]) {
+            *x += y;
+        }
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     for (x, y) in dst.iter_mut().zip(src) {
         *x += y;
     }
