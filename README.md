@@ -14,14 +14,26 @@ feature.
 
 ## Build and run
 
-Use stable Rust and a local GGUF file:
+Use stable Rust and either let the CLI download the default 2B-1.25Bit model
+automatically into `data/`, or provide a local GGUF file:
 
 ```sh
 cargo build --release --locked
+
+# Start the server (downloads the 2B-1.25Bit model into data/ on first run):
+./target/release/hy-mt-rs serve
+
+# Or specify an existing model file:
 ./target/release/hy-mt-rs serve \
   --model models/Hy-MT2-1.8B-1.25Bit.gguf \
   --model-id hy-mt2 \
   --listen 127.0.0.1:8080
+```
+
+You can also explicitly pre-download the 2B-1.25Bit model:
+
+```sh
+./target/release/hy-mt-rs download
 ```
 
 Download a GGUF from the official repositories below, or use the optional

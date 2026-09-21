@@ -1,5 +1,6 @@
 /target/
 /models/
+/data/
 /.cache/
 *.gguf
 *.part

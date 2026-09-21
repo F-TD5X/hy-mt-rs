@@ -28,6 +28,8 @@ tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
+indicatif = "0.18"
 
 [dev-dependencies]
 http-body-util = "0.1"

@@ -32,14 +32,36 @@ enum Command {
     Inspect(Inspect),
     /// Measure local inference, without HTTP.
     Bench(Bench),
+    /// Download the 2B-1.25Bit model into the data folder.
+    Download(DownloadArgs),
 }
 
 #[derive(Args)]
 struct ModelArgs {
+    /// Path to GGUF model file. If not provided, downloads and uses the 2B-1.25Bit model in data/.
     #[arg(long)]
-    model: PathBuf,
+    model: Option<PathBuf>,
     #[arg(long, value_enum, default_value = "auto")]
     gguf_profile: Profile,
+}
+
+impl ModelArgs {
+    pub fn resolve(&self) -> Result<PathBuf> {
+        match &self.model {
+            Some(path) => Ok(path.clone()),
+            None => hy_mt_rs::download::ensure_default_model(None),
+        }
+    }
+}
+
+#[derive(Args)]
+struct DownloadArgs {
+    /// Destination directory for the model file.
+    #[arg(long)]
+    dir: Option<PathBuf>,
+    /// Force download even if the model already exists and is verified.
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(Args)]
@@ -141,11 +163,24 @@ fn main() -> Result<()> {
         Command::Inspect(args) => inspect(args),
         Command::Bench(args) => bench(args),
         Command::Serve(args) => serve(args),
+        Command::Download(args) => download_cmd(args),
     }
 }
 
+fn download_cmd(args: DownloadArgs) -> Result<()> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(hy_mt_rs::download::download_default_model(
+            args.dir.as_deref(),
+            args.force,
+        ))?;
+    Ok(())
+}
+
 fn inspect(args: Inspect) -> Result<()> {
-    let g = Gguf::open(&args.model.model, args.model.gguf_profile)?;
+    let model_path = args.model.resolve()?;
+    let g = Gguf::open(&model_path, args.model.gguf_profile)?;
     let mut counts = BTreeMap::new();
     for t in g.tensors.values() {
         *counts.entry(format!("{:?}", t.dtype)).or_insert(0usize) += 1;
@@ -165,7 +200,8 @@ fn inspect(args: Inspect) -> Result<()> {
 
 fn serve(args: Serve) -> Result<()> {
     let started = Instant::now();
-    let model = Arc::new(Model::open(&args.model.model, args.model.gguf_profile)?);
+    let model_path = args.model.resolve()?;
+    let model = Arc::new(Model::open(&model_path, args.model.gguf_profile)?);
     let config = ServerConfig {
         model_id: args.model_id,
         context_size: args.ctx_size,
@@ -204,7 +240,8 @@ fn bench(args: Bench) -> Result<()> {
         "concurrency and threads must be positive"
     );
     let started = Instant::now();
-    let model = Model::open(&args.model.model, args.model.gguf_profile)?;
+    let model_path = args.model.resolve()?;
+    let model = Model::open(&model_path, args.model.gguf_profile)?;
     let load_ms = started.elapsed().as_secs_f64() * 1000.;
     let text = if let Some(path) = args.prompt_file {
         std::fs::read_to_string(path)?
