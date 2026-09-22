@@ -20,7 +20,7 @@ use axum::{
     },
     routing::{get, post},
 };
-use rayon::{ThreadPool, ThreadPoolBuilder};
+use rayon::ThreadPool;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{Semaphore, mpsc};
@@ -75,10 +75,7 @@ pub fn router_with_shutdown(
         capacity <= Semaphore::MAX_PERMITS,
         "queue capacity is too large"
     );
-    let cpu = ThreadPoolBuilder::new()
-        .num_threads(config.threads)
-        .thread_name(|n| format!("hy-cpu-{n}"))
-        .build()?;
+    let cpu = crate::affinity::create_cpu_pool(config.threads)?;
     let app = Arc::new(App {
         slots: Arc::new(Semaphore::new(config.max_concurrent_requests)),
         admission: Arc::new(Semaphore::new(capacity)),

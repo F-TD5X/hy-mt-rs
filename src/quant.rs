@@ -368,58 +368,57 @@ impl Weight {
         let row_bytes = cols / self.dtype().block_len() * self.dtype().block_bytes();
         let dtype = self.dtype();
         let all_bytes = self.bytes();
+        out.par_chunks_mut(chunk_size)
+            .enumerate()
+            .for_each(|(chunk_idx, chunk)| {
+                let base_row = chunk_idx * chunk_size;
+                let chunk_bytes =
+                    &all_bytes[base_row * row_bytes..(base_row + chunk.len()) * row_bytes];
+                Self::compute_chunk_q8(dtype, chunk_bytes, row_bytes, chunk, q8_values, q8_scales);
+            });
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn compute_chunk_q8(
+        dtype: DType,
+        chunk_bytes: &[u8],
+        row_bytes: usize,
+        chunk_out: &mut [f32],
+        q8_values: &[i8],
+        q8_scales: &[f32],
+    ) {
         match dtype {
             DType::STQ1_0 => {
-                out.par_chunks_mut(chunk_size)
-                    .enumerate()
-                    .for_each(|(chunk_idx, chunk)| {
-                        let base_row = chunk_idx * chunk_size;
-                        let chunk_bytes =
-                            &all_bytes[base_row * row_bytes..(base_row + chunk.len()) * row_bytes];
-                        for (val, row) in chunk.iter_mut().zip(chunk_bytes.chunks_exact(row_bytes))
-                        {
-                            *val = unsafe { stq_row_dot_sdot(row, q8_values, q8_scales) };
-                        }
-                    });
+                for (val, row) in chunk_out
+                    .iter_mut()
+                    .zip(chunk_bytes.chunks_exact(row_bytes))
+                {
+                    *val = unsafe { stq_row_dot_sdot(row, q8_values, q8_scales) };
+                }
             }
             DType::Q2_0C => {
-                out.par_chunks_mut(chunk_size)
-                    .enumerate()
-                    .for_each(|(chunk_idx, chunk)| {
-                        let base_row = chunk_idx * chunk_size;
-                        let chunk_bytes =
-                            &all_bytes[base_row * row_bytes..(base_row + chunk.len()) * row_bytes];
-                        for (val, row) in chunk.iter_mut().zip(chunk_bytes.chunks_exact(row_bytes))
-                        {
-                            *val = unsafe { q2c_row_dot_sdot(row, q8_values, q8_scales) };
-                        }
-                    });
+                for (val, row) in chunk_out
+                    .iter_mut()
+                    .zip(chunk_bytes.chunks_exact(row_bytes))
+                {
+                    *val = unsafe { q2c_row_dot_sdot(row, q8_values, q8_scales) };
+                }
             }
             DType::Q6_K => {
-                out.par_chunks_mut(chunk_size)
-                    .enumerate()
-                    .for_each(|(chunk_idx, chunk)| {
-                        let base_row = chunk_idx * chunk_size;
-                        let chunk_bytes =
-                            &all_bytes[base_row * row_bytes..(base_row + chunk.len()) * row_bytes];
-                        for (val, row) in chunk.iter_mut().zip(chunk_bytes.chunks_exact(row_bytes))
-                        {
-                            *val = unsafe { q6_row_dot_sdot(row, q8_values, q8_scales) };
-                        }
-                    });
+                for (val, row) in chunk_out
+                    .iter_mut()
+                    .zip(chunk_bytes.chunks_exact(row_bytes))
+                {
+                    *val = unsafe { q6_row_dot_sdot(row, q8_values, q8_scales) };
+                }
             }
             _ => {
-                out.par_chunks_mut(chunk_size)
-                    .enumerate()
-                    .for_each(|(chunk_idx, chunk)| {
-                        let base_row = chunk_idx * chunk_size;
-                        let chunk_bytes =
-                            &all_bytes[base_row * row_bytes..(base_row + chunk.len()) * row_bytes];
-                        for (val, row) in chunk.iter_mut().zip(chunk_bytes.chunks_exact(row_bytes))
-                        {
-                            *val = unsafe { row_dot_q8_raw(dtype, row, q8_values, q8_scales) };
-                        }
-                    });
+                for (val, row) in chunk_out
+                    .iter_mut()
+                    .zip(chunk_bytes.chunks_exact(row_bytes))
+                {
+                    *val = unsafe { row_dot_q8_raw(dtype, row, q8_values, q8_scales) };
+                }
             }
         }
     }
@@ -461,51 +460,59 @@ impl Weight {
         (0..num_chunks).into_par_iter().for_each(|chunk_idx| {
             let start = chunk_idx * chunk_size;
             let end = (start + chunk_size).min(total_rows);
-            for r in start..end {
-                let val = if r < q_rows {
-                    let row = &q_bytes[r * q_row_bytes..(r + 1) * q_row_bytes];
-                    unsafe {
-                        match q_dtype {
-                            DType::STQ1_0 => stq_row_dot_sdot(row, q8_vals, q8_scs),
-                            DType::Q2_0C => q2c_row_dot_sdot(row, q8_vals, q8_scs),
-                            DType::Q6_K => q6_row_dot_sdot(row, q8_vals, q8_scs),
-                            _ => row_dot_q8_raw(q_dtype, row, q8_vals, q8_scs),
-                        }
-                    }
-                } else if r < q_rows + k_rows {
-                    let kr = r - q_rows;
-                    let row = &k_bytes[kr * k_row_bytes..(kr + 1) * k_row_bytes];
-                    unsafe {
-                        match k_dtype {
-                            DType::STQ1_0 => stq_row_dot_sdot(row, q8_vals, q8_scs),
-                            DType::Q2_0C => q2c_row_dot_sdot(row, q8_vals, q8_scs),
-                            DType::Q6_K => q6_row_dot_sdot(row, q8_vals, q8_scs),
-                            _ => row_dot_q8_raw(k_dtype, row, q8_vals, q8_scs),
-                        }
-                    }
-                } else {
-                    let vr = r - q_rows - k_rows;
-                    let row = &v_bytes[vr * v_row_bytes..(vr + 1) * v_row_bytes];
-                    unsafe {
-                        match v_dtype {
-                            DType::STQ1_0 => stq_row_dot_sdot(row, q8_vals, q8_scs),
-                            DType::Q2_0C => q2c_row_dot_sdot(row, q8_vals, q8_scs),
-                            DType::Q6_K => q6_row_dot_sdot(row, q8_vals, q8_scs),
-                            _ => row_dot_q8_raw(v_dtype, row, q8_vals, q8_scs),
-                        }
-                    }
+            // Process the portion in Q
+            if start < q_rows {
+                let chunk_len = end.min(q_rows) - start;
+                let chunk_bytes = &q_bytes[start * q_row_bytes..(start + chunk_len) * q_row_bytes];
+                let chunk_out = unsafe {
+                    std::slice::from_raw_parts_mut((q_ptr as *mut f32).add(start), chunk_len)
                 };
-
-                // SAFETY: each r in 0..total_rows is unique, writing to disjoint indices in q_out, k_out, or v_out.
-                unsafe {
-                    if r < q_rows {
-                        *(q_ptr as *mut f32).add(r) = val;
-                    } else if r < q_rows + k_rows {
-                        *(k_ptr as *mut f32).add(r - q_rows) = val;
-                    } else {
-                        *(v_ptr as *mut f32).add(r - q_rows - k_rows) = val;
-                    }
-                }
+                Self::compute_chunk_q8(
+                    q_dtype,
+                    chunk_bytes,
+                    q_row_bytes,
+                    chunk_out,
+                    q8_vals,
+                    q8_scs,
+                );
+            }
+            // Process the portion in K
+            if start < q_rows + k_rows && end > q_rows {
+                let k_start = start.max(q_rows) - q_rows;
+                let k_end = end.min(q_rows + k_rows) - q_rows;
+                let chunk_len = k_end - k_start;
+                let chunk_bytes =
+                    &k_bytes[k_start * k_row_bytes..(k_start + chunk_len) * k_row_bytes];
+                let chunk_out = unsafe {
+                    std::slice::from_raw_parts_mut((k_ptr as *mut f32).add(k_start), chunk_len)
+                };
+                Self::compute_chunk_q8(
+                    k_dtype,
+                    chunk_bytes,
+                    k_row_bytes,
+                    chunk_out,
+                    q8_vals,
+                    q8_scs,
+                );
+            }
+            // Process the portion in V
+            if end > q_rows + k_rows {
+                let v_start = start.max(q_rows + k_rows) - q_rows - k_rows;
+                let v_end = end - q_rows - k_rows;
+                let chunk_len = v_end - v_start;
+                let chunk_bytes =
+                    &v_bytes[v_start * v_row_bytes..(v_start + chunk_len) * v_row_bytes];
+                let chunk_out = unsafe {
+                    std::slice::from_raw_parts_mut((v_ptr as *mut f32).add(v_start), chunk_len)
+                };
+                Self::compute_chunk_q8(
+                    v_dtype,
+                    chunk_bytes,
+                    v_row_bytes,
+                    chunk_out,
+                    q8_vals,
+                    q8_scs,
+                );
             }
         });
         Ok(())
@@ -979,11 +986,16 @@ pub(crate) fn sdot_available() -> bool {
 }
 
 /// Rows per rayon task for the batch-1 GEMV path. Rows are short once the
-/// integer kernels run, so many small tasks balance better than a few large
-/// ones; 32 rows is the useful floor at roughly 2 microseconds of work.
+/// integer kernels run; balancing across 4 tasks per thread provides low
+/// dispatch overhead while keeping chunks aligned to pairs for dual-row SDOT.
 fn chunk_rows(rows: usize) -> usize {
     let target_chunks = (rayon::current_num_threads() * 16).max(1);
-    (rows / target_chunks).clamp(32, 2048)
+    let chunk = (rows / target_chunks).clamp(32, 2048);
+    if !chunk.is_multiple_of(2) && chunk < 2048 {
+        chunk + 1
+    } else {
+        chunk
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -2079,41 +2091,73 @@ unsafe fn q6_row_dot_sdot(row_bytes: &[u8], activations: &[i8], scales: &[f32]) 
                 let ql = block.as_ptr().add(c * 64);
                 let qh = block.as_ptr().add(128 + c * 32);
                 let sc = block.as_ptr().add(192 + c * 8);
-                for p in 0..4usize {
-                    let qlv0 = vld1q_u8(ql.add((p & 1) * 32));
-                    let qlv1 = vld1q_u8(ql.add((p & 1) * 32 + 16));
-                    let qhv0 = vld1q_u8(qh);
-                    let qhv1 = vld1q_u8(qh.add(16));
 
-                    let lo6_0 = match p {
-                        2 | 3 => vandq_u8(vshrq_n_u8(qlv0, 4), mask15),
-                        _ => vandq_u8(qlv0, mask15),
-                    };
-                    let lo6_1 = match p {
-                        2 | 3 => vandq_u8(vshrq_n_u8(qlv1, 4), mask15),
-                        _ => vandq_u8(qlv1, mask15),
-                    };
-                    let (bits0, bits1) = match p {
-                        0 => (qhv0, qhv1),
-                        1 => (vshrq_n_u8(qhv0, 2), vshrq_n_u8(qhv1, 2)),
-                        2 => (vshrq_n_u8(qhv0, 4), vshrq_n_u8(qhv1, 4)),
-                        _ => (vshrq_n_u8(qhv0, 6), vshrq_n_u8(qhv1, 6)),
-                    };
-                    let q6_0 = vorrq_u8(lo6_0, vshlq_n_u8(vandq_u8(bits0, mask3), 4));
-                    let q6_1 = vorrq_u8(lo6_1, vshlq_n_u8(vandq_u8(bits1, mask3), 4));
-                    let digits0 = vsubq_s8(vreinterpretq_s8_u8(q6_0), c32);
-                    let digits1 = vsubq_s8(vreinterpretq_s8_u8(q6_1), c32);
+                let qlv0 = vld1q_u8(ql);
+                let qlv1 = vld1q_u8(ql.add(16));
+                let qlv2 = vld1q_u8(ql.add(32));
+                let qlv3 = vld1q_u8(ql.add(48));
+                let qhv0 = vld1q_u8(qh);
+                let qhv1 = vld1q_u8(qh.add(16));
 
-                    let base0 = x_ptr.add(c * 128 + p * 32);
-                    let base1 = base0.add(16);
-                    let acc0 = sdot(vdupq_n_s32(0), vld1q_s8(base0), digits0);
-                    let acc1 = sdot(vdupq_n_s32(0), vld1q_s8(base1), digits1);
+                // p = 0
+                let lo6_0 = vandq_u8(qlv0, mask15);
+                let lo6_1 = vandq_u8(qlv1, mask15);
+                let q6_0 = vorrq_u8(lo6_0, vshlq_n_u8(vandq_u8(qhv0, mask3), 4));
+                let q6_1 = vorrq_u8(lo6_1, vshlq_n_u8(vandq_u8(qhv1, mask3), 4));
+                let digits0 = vsubq_s8(vreinterpretq_s8_u8(q6_0), c32);
+                let digits1 = vsubq_s8(vreinterpretq_s8_u8(q6_1), c32);
+                let base0 = x_ptr.add(c * 128);
+                let acc0 = sdot(vdupq_n_s32(0), vld1q_s8(base0), digits0);
+                let acc1 = sdot(vdupq_n_s32(0), vld1q_s8(base0.add(16)), digits1);
+                let plane0 = d * (*sc as i8) as f32;
+                let plane1 = d * (*sc.add(1) as i8) as f32;
+                row_acc0 = vfmaq_n_f32(row_acc0, vcvtq_f32_s32(acc0), plane0);
+                row_acc1 = vfmaq_n_f32(row_acc1, vcvtq_f32_s32(acc1), plane1);
 
-                    let plane0 = d * (*sc.add(2 * p) as i8) as f32;
-                    let plane1 = d * (*sc.add(2 * p + 1) as i8) as f32;
-                    row_acc0 = vfmaq_n_f32(row_acc0, vcvtq_f32_s32(acc0), plane0);
-                    row_acc1 = vfmaq_n_f32(row_acc1, vcvtq_f32_s32(acc1), plane1);
-                }
+                // p = 1
+                let lo6_2 = vandq_u8(qlv2, mask15);
+                let lo6_3 = vandq_u8(qlv3, mask15);
+                let q6_2 = vorrq_u8(lo6_2, vshlq_n_u8(vandq_u8(vshrq_n_u8(qhv0, 2), mask3), 4));
+                let q6_3 = vorrq_u8(lo6_3, vshlq_n_u8(vandq_u8(vshrq_n_u8(qhv1, 2), mask3), 4));
+                let digits2 = vsubq_s8(vreinterpretq_s8_u8(q6_2), c32);
+                let digits3 = vsubq_s8(vreinterpretq_s8_u8(q6_3), c32);
+                let base1 = x_ptr.add(c * 128 + 32);
+                let acc2 = sdot(vdupq_n_s32(0), vld1q_s8(base1), digits2);
+                let acc3 = sdot(vdupq_n_s32(0), vld1q_s8(base1.add(16)), digits3);
+                let plane2 = d * (*sc.add(2) as i8) as f32;
+                let plane3 = d * (*sc.add(3) as i8) as f32;
+                row_acc0 = vfmaq_n_f32(row_acc0, vcvtq_f32_s32(acc2), plane2);
+                row_acc1 = vfmaq_n_f32(row_acc1, vcvtq_f32_s32(acc3), plane3);
+
+                // p = 2
+                let lo6_4 = vshrq_n_u8(qlv0, 4);
+                let lo6_5 = vshrq_n_u8(qlv1, 4);
+                let q6_4 = vorrq_u8(lo6_4, vshlq_n_u8(vandq_u8(vshrq_n_u8(qhv0, 4), mask3), 4));
+                let q6_5 = vorrq_u8(lo6_5, vshlq_n_u8(vandq_u8(vshrq_n_u8(qhv1, 4), mask3), 4));
+                let digits4 = vsubq_s8(vreinterpretq_s8_u8(q6_4), c32);
+                let digits5 = vsubq_s8(vreinterpretq_s8_u8(q6_5), c32);
+                let base2 = x_ptr.add(c * 128 + 64);
+                let acc4 = sdot(vdupq_n_s32(0), vld1q_s8(base2), digits4);
+                let acc5 = sdot(vdupq_n_s32(0), vld1q_s8(base2.add(16)), digits5);
+                let plane4 = d * (*sc.add(4) as i8) as f32;
+                let plane5 = d * (*sc.add(5) as i8) as f32;
+                row_acc0 = vfmaq_n_f32(row_acc0, vcvtq_f32_s32(acc4), plane4);
+                row_acc1 = vfmaq_n_f32(row_acc1, vcvtq_f32_s32(acc5), plane5);
+
+                // p = 3
+                let lo6_6 = vshrq_n_u8(qlv2, 4);
+                let lo6_7 = vshrq_n_u8(qlv3, 4);
+                let q6_6 = vorrq_u8(lo6_6, vshlq_n_u8(vandq_u8(vshrq_n_u8(qhv0, 6), mask3), 4));
+                let q6_7 = vorrq_u8(lo6_7, vshlq_n_u8(vandq_u8(vshrq_n_u8(qhv1, 6), mask3), 4));
+                let digits6 = vsubq_s8(vreinterpretq_s8_u8(q6_6), c32);
+                let digits7 = vsubq_s8(vreinterpretq_s8_u8(q6_7), c32);
+                let base3 = x_ptr.add(c * 128 + 96);
+                let acc6 = sdot(vdupq_n_s32(0), vld1q_s8(base3), digits6);
+                let acc7 = sdot(vdupq_n_s32(0), vld1q_s8(base3.add(16)), digits7);
+                let plane6 = d * (*sc.add(6) as i8) as f32;
+                let plane7 = d * (*sc.add(7) as i8) as f32;
+                row_acc0 = vfmaq_n_f32(row_acc0, vcvtq_f32_s32(acc6), plane6);
+                row_acc1 = vfmaq_n_f32(row_acc1, vcvtq_f32_s32(acc7), plane7);
             }
             x_ptr = x_ptr.add(256);
         }

@@ -1,5 +1,6 @@
 //! Hy-MT2 CPU inference from local GGUF files.
 
+pub mod affinity;
 pub mod download;
 pub mod generation;
 pub mod gguf;

@@ -1,18 +1,8 @@
-use std::{net::SocketAddr, sync::Arc};
-
 use anyhow::Result;
-use axum::{
-    Router,
-    body::Bytes,
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    routing::get,
-};
+use axum::{Router, body::Bytes, extract::State, http::StatusCode, routing::get};
 use hy_mt_rs::download::{
-    DEFAULT_MODEL_BYTES, DEFAULT_MODEL_DIR, DEFAULT_MODEL_FILENAME, DEFAULT_MODEL_SHA256,
-    compute_sha256, default_data_dir, default_model_path, default_model_url,
-    download_model_from_url, verify_file_sha256,
+    DEFAULT_MODEL_DIR, DEFAULT_MODEL_FILENAME, compute_sha256, default_data_dir,
+    default_model_path, default_model_url, download_model_from_url, verify_file_sha256,
 };
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
@@ -54,7 +44,10 @@ fn test_sha256_verification() -> Result<()> {
 
     assert_eq!(compute_sha256(&file_path)?, expected_sha256);
     assert!(verify_file_sha256(&file_path, &expected_sha256)?);
-    assert!(!verify_file_sha256(&file_path, "0000000000000000000000000000000000000000000000000000000000000000")?);
+    assert!(!verify_file_sha256(
+        &file_path,
+        "0000000000000000000000000000000000000000000000000000000000000000"
+    )?);
 
     Ok(())
 }
@@ -67,9 +60,16 @@ async fn test_download_from_mock_server() -> Result<()> {
     let payload_len = payload.len() as u64;
 
     let app = Router::new()
-        .route("/model.gguf", get(|State(data): State<Bytes>| async move {
-            (StatusCode::OK, [("content-length", data.len().to_string())], data)
-        }))
+        .route(
+            "/model.gguf",
+            get(|State(data): State<Bytes>| async move {
+                (
+                    StatusCode::OK,
+                    [("content-length", data.len().to_string())],
+                    data,
+                )
+            }),
+        )
         .with_state(payload_bytes);
 
     let listener = TcpListener::bind("127.0.0.1:0").await?;

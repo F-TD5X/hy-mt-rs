@@ -9,7 +9,6 @@ use hy_mt_rs::{
     server::{self, ServerConfig},
     tokenizer::{ChatMessage, Role},
 };
-use rayon::ThreadPoolBuilder;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
@@ -120,35 +119,8 @@ struct Bench {
 }
 
 /// Worker threads for the shared CPU pool.
-///
-/// macOS exposes asymmetric cores as `perflevel0` (performance) and
-/// `perflevel1` (efficiency). Pool threads run at user-interactive QoS, which
-/// the scheduler places on the performance cores, so including the efficiency
-/// cores only oversubscribes those and slows decode. Elsewhere every logical
-/// CPU is used.
 fn default_threads() -> usize {
-    #[cfg(target_os = "macos")]
-    if let Some(performance) = performance_core_count() {
-        return performance;
-    }
-    std::thread::available_parallelism().map_or(1, usize::from)
-}
-
-#[cfg(target_os = "macos")]
-fn performance_core_count() -> Option<usize> {
-    let mut count: libc::c_int = 0;
-    let mut size = std::mem::size_of_val(&count);
-    // SAFETY: sysctlbyname writes at most `size` bytes into `count`.
-    let status = unsafe {
-        libc::sysctlbyname(
-            c"hw.perflevel0.logicalcpu".as_ptr(),
-            std::ptr::from_mut(&mut count).cast(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    (status == 0 && count > 0).then_some(count as usize)
+    hy_mt_rs::affinity::default_threads()
 }
 
 fn main() -> Result<()> {
@@ -264,17 +236,16 @@ fn bench(args: Bench) -> Result<()> {
         sampling,
         stop: vec![],
     };
-    set_high_priority();
-    let pool = ThreadPoolBuilder::new()
-        .num_threads(args.threads)
-        .start_handler(|_| set_high_priority())
-        .build()?;
+    hy_mt_rs::affinity::pin_current_thread_to_performance_cores();
+    hy_mt_rs::affinity::set_high_priority();
+    let pool = hy_mt_rs::affinity::create_cpu_pool(args.threads)?;
     let wall_start = Instant::now();
     let runs = std::thread::scope(|scope| -> Result<Vec<_>> {
         let handles: Vec<_> = (0..args.concurrency)
             .map(|_| {
                 scope.spawn(|| {
-                    set_high_priority();
+                    hy_mt_rs::affinity::pin_current_thread_to_performance_cores();
+                    hy_mt_rs::affinity::set_high_priority();
                     Generator::with_pool(&model, &pool).generate(
                         &prompt,
                         args.ctx_size,
@@ -309,20 +280,6 @@ fn bench(args: Bench) -> Result<()> {
     );
     Ok(())
 }
-
-#[cfg(target_os = "macos")]
-fn set_high_priority() {
-    unsafe extern "C" {
-        fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
-    }
-    // QOS_CLASS_USER_INTERACTIVE = 0x21
-    unsafe {
-        pthread_set_qos_class_self_np(0x21, 0);
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn set_high_priority() {}
 
 #[cfg(unix)]
 fn peak_rss_bytes() -> Option<u64> {
