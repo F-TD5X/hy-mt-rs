@@ -496,6 +496,7 @@ impl Model {
                                 &session.q8_hidden,
                                 &mut session.gate,
                             );
+
                             session.q8_ffn.quantize_into(&session.gate);
                             ff.down.gemv_q8_fast(&session.q8_ffn, &mut session.ff);
                         } else {

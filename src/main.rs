@@ -236,20 +236,30 @@ fn bench(args: Bench) -> Result<()> {
         sampling,
         stop: vec![],
     };
-    hy_mt_rs::affinity::pin_current_thread_to_performance_cores();
-    hy_mt_rs::affinity::set_high_priority();
+    let perf_cores = hy_mt_rs::affinity::performance_cores();
     let pool = hy_mt_rs::affinity::create_cpu_pool(args.threads)?;
+    let model_ref = &model;
+    let pool_ref = &pool;
+    let prompt_ref = &prompt;
+    let options_ref = &options;
     let wall_start = Instant::now();
     let runs = std::thread::scope(|scope| -> Result<Vec<_>> {
         let handles: Vec<_> = (0..args.concurrency)
-            .map(|_| {
-                scope.spawn(|| {
-                    hy_mt_rs::affinity::pin_current_thread_to_performance_cores();
+            .map(|i| {
+                let target_core = if !perf_cores.is_empty() {
+                    Some(perf_cores[i % perf_cores.len()])
+                } else {
+                    None
+                };
+                scope.spawn(move || {
                     hy_mt_rs::affinity::set_high_priority();
-                    Generator::with_pool(&model, &pool).generate(
-                        &prompt,
+                    if let Some(core) = target_core {
+                        hy_mt_rs::affinity::set_core_affinity(core);
+                    }
+                    Generator::with_pool(model_ref, pool_ref).generate(
+                        prompt_ref,
                         args.ctx_size,
-                        &options,
+                        options_ref,
                         &CancellationToken::new(),
                         |_| Ok(()),
                     )

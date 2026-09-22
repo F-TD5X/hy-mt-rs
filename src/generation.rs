@@ -167,6 +167,7 @@ impl Generator<'_> {
         for step in 0..options.max_tokens {
             check_cancel(cancel)?;
             let token = sampler.sample(&mut logits)?;
+
             if step == 0 {
                 first_token_ms = started.elapsed().as_secs_f64() * 1000.;
             }
@@ -175,10 +176,12 @@ impl Generator<'_> {
                 finish_reason = FinishReason::Stop;
                 break;
             }
-            let delta = output.push(model.tokenizer.piece(token)?);
+            let piece = model.tokenizer.piece(token)?;
+            let delta = output.push(piece);
             if !delta.is_empty() {
                 on_text(&delta)?;
             }
+
             if output.stopped {
                 finish_reason = FinishReason::Stop;
                 break;
@@ -270,18 +273,21 @@ impl Sampler {
                     };
                 }
             }
+            ensure!(
+                logits.iter().all(|x| x.is_finite()),
+                "repetition_penalty overflowed the logits"
+            );
         }
-        ensure!(
-            logits.iter().all(|x| x.is_finite()),
-            "repetition_penalty overflowed the logits"
-        );
         let token = if self.params.temperature == 0. {
-            logits
-                .iter()
-                .enumerate()
-                .max_by(|(i, a), (j, b)| a.total_cmp(b).then_with(|| j.cmp(i)))
-                .expect("nonempty logits")
-                .0
+            let mut best_token = 0;
+            let mut best_val = logits[0];
+            for (i, &val) in logits.iter().enumerate().skip(1) {
+                if val > best_val {
+                    best_val = val;
+                    best_token = i;
+                }
+            }
+            best_token
         } else {
             self.ranked.clear();
             self.ranked.extend(logits.iter().copied().enumerate());

@@ -1,0 +1,2 @@
+[build]
+rustflags = ["-C", "target-feature=+v8.2a,+fp16,+dotprod"]

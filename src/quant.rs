@@ -347,13 +347,13 @@ impl Weight {
     #[cfg(target_arch = "aarch64")]
     fn gemv_q8(&self, input: &[f32], out: &mut [f32], chunk_size: usize) {
         let q8 = Q8::quantize(input);
-        self.gemv_q8_with_chunk(q8.values(), q8.scales(), out, chunk_size);
+        self.gemv_q8_with_chunk(q8.values(), q8.scales(), q8.values_q2c(), out, chunk_size);
     }
 
     #[cfg(target_arch = "aarch64")]
     pub(crate) fn gemv_q8_fast(&self, q8: &Q8, out: &mut [f32]) {
         let chunk_size = chunk_rows(self.shape()[1]);
-        self.gemv_q8_with_chunk(q8.values(), q8.scales(), out, chunk_size);
+        self.gemv_q8_with_chunk(q8.values(), q8.scales(), q8.values_q2c(), out, chunk_size);
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -361,6 +361,7 @@ impl Weight {
         &self,
         q8_values: &[i8],
         q8_scales: &[f32],
+        q8_q2c: &[i8],
         out: &mut [f32],
         chunk_size: usize,
     ) {
@@ -374,7 +375,7 @@ impl Weight {
                 let base_row = chunk_idx * chunk_size;
                 let chunk_bytes =
                     &all_bytes[base_row * row_bytes..(base_row + chunk.len()) * row_bytes];
-                Self::compute_chunk_q8(dtype, chunk_bytes, row_bytes, chunk, q8_values, q8_scales);
+                Self::compute_chunk_q8(dtype, chunk_bytes, row_bytes, chunk, q8_values, q8_scales, q8_q2c);
             });
     }
 
@@ -386,6 +387,7 @@ impl Weight {
         chunk_out: &mut [f32],
         q8_values: &[i8],
         q8_scales: &[f32],
+        q8_q2c: &[i8],
     ) {
         match dtype {
             DType::STQ1_0 => {
@@ -397,11 +399,24 @@ impl Weight {
                 }
             }
             DType::Q2_0C => {
-                for (val, row) in chunk_out
-                    .iter_mut()
-                    .zip(chunk_bytes.chunks_exact(row_bytes))
-                {
-                    *val = unsafe { q2c_row_dot_sdot(row, q8_values, q8_scales) };
+                let mut out_pairs = chunk_out.chunks_exact_mut(2);
+                let mut byte_pairs = chunk_bytes.chunks_exact(row_bytes * 2);
+                for (val_pair, row_pair) in out_pairs.by_ref().zip(byte_pairs.by_ref()) {
+                    let (v0, v1) = unsafe {
+                        q2c_2rows_dot_sdot(
+                            &row_pair[..row_bytes],
+                            &row_pair[row_bytes..],
+                            q8_q2c,
+                            q8_scales,
+                        )
+                    };
+                    val_pair[0] = v0;
+                    val_pair[1] = v1;
+                }
+                let rem_out = out_pairs.into_remainder();
+                let rem_bytes = byte_pairs.remainder();
+                if !rem_out.is_empty() {
+                    rem_out[0] = unsafe { q2c_row_dot_sdot(&rem_bytes[..row_bytes], q8_q2c, q8_scales) };
                 }
             }
             DType::Q6_K => {
@@ -417,7 +432,7 @@ impl Weight {
                     .iter_mut()
                     .zip(chunk_bytes.chunks_exact(row_bytes))
                 {
-                    *val = unsafe { row_dot_q8_raw(dtype, row, q8_values, q8_scales) };
+                    *val = unsafe { row_dot_q8_raw(dtype, row, q8_values, q8_scales, q8_q2c) };
                 }
             }
         }
@@ -451,6 +466,7 @@ impl Weight {
         let v_bytes = v.bytes();
         let q8_vals = q8.values();
         let q8_scs = q8.scales();
+        let q8_q2c = q8.values_q2c();
 
         let q_ptr = q_out.as_mut_ptr() as usize;
         let k_ptr = k_out.as_mut_ptr() as usize;
@@ -474,6 +490,7 @@ impl Weight {
                     chunk_out,
                     q8_vals,
                     q8_scs,
+                    q8_q2c,
                 );
             }
             // Process the portion in K
@@ -493,6 +510,7 @@ impl Weight {
                     chunk_out,
                     q8_vals,
                     q8_scs,
+                    q8_q2c,
                 );
             }
             // Process the portion in V
@@ -512,6 +530,7 @@ impl Weight {
                     chunk_out,
                     q8_vals,
                     q8_scs,
+                    q8_q2c,
                 );
             }
         });
@@ -528,6 +547,7 @@ impl Weight {
         let up_bytes = up.bytes();
         let q8_vals = q8.values();
         let q8_scs = q8.scales();
+        let q8_q2c = q8.values_q2c();
 
         match dtype {
             DType::STQ1_0 => {
@@ -570,10 +590,7 @@ impl Weight {
                             .zip(up_chunk.chunks_exact(row_bytes))
                         {
                             let (g, u) = unsafe {
-                                (
-                                    q2c_row_dot_sdot(g_b, q8_vals, q8_scs),
-                                    q2c_row_dot_sdot(u_b, q8_vals, q8_scs),
-                                )
+                                q2c_2rows_dot_sdot(g_b, u_b, q8_q2c, q8_scs)
                             };
                             let silu = g / (1.0 + (-g).exp());
                             *val = silu * u;
@@ -621,8 +638,8 @@ impl Weight {
                         {
                             let (g, u) = unsafe {
                                 (
-                                    row_dot_q8_raw(dtype, g_b, q8_vals, q8_scs),
-                                    row_dot_q8_raw(dtype, u_b, q8_vals, q8_scs),
+                                    row_dot_q8_raw(dtype, g_b, q8_vals, q8_scs, q8_q2c),
+                                    row_dot_q8_raw(dtype, u_b, q8_vals, q8_scs, q8_q2c),
                                 )
                             };
                             let silu = g / (1.0 + (-g).exp());
@@ -844,6 +861,7 @@ const Q8_GROUP: usize = 256;
 pub(crate) struct Q8 {
     values: Vec<i8>,
     scales: Vec<f32>,
+    values_q2c: Vec<i8>,
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -879,6 +897,7 @@ impl Q8 {
         Self {
             values: vec![0i8; len],
             scales: vec![0f32; len.div_ceil(Q8_GROUP)],
+            values_q2c: vec![0i8; len],
         }
     }
 
@@ -899,6 +918,7 @@ impl Q8 {
             // SAFETY: both slices have the same length.
             unsafe { quantize_group_neon(source, inverse, target) };
         }
+        unsafe { deinterleave_q2c(&self.values, &mut self.values_q2c) };
     }
 
     pub(crate) fn quantize(input: &[f32]) -> Self {
@@ -911,8 +931,34 @@ impl Q8 {
         &self.values
     }
 
+    pub(crate) fn values_q2c(&self) -> &[i8] {
+        &self.values_q2c
+    }
+
     pub(crate) fn scales(&self) -> &[f32] {
         &self.scales
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn deinterleave_q2c(source: &[i8], target: &mut [i8]) {
+    use std::arch::aarch64::*;
+    unsafe {
+        let mut i = 0;
+        let s_ptr = source.as_ptr();
+        let t_ptr = target.as_mut_ptr();
+        while i + 64 <= source.len() {
+            let val = vld4q_s8(s_ptr.add(i));
+            vst1q_s8(t_ptr.add(i), val.0);
+            vst1q_s8(t_ptr.add(i + 16), val.1);
+            vst1q_s8(t_ptr.add(i + 32), val.2);
+            vst1q_s8(t_ptr.add(i + 48), val.3);
+            i += 64;
+        }
+        for j in i..source.len() {
+            target[j] = source[j];
+        }
     }
 }
 
@@ -989,7 +1035,7 @@ pub(crate) fn sdot_available() -> bool {
 /// integer kernels run; balancing across 4 tasks per thread provides low
 /// dispatch overhead while keeping chunks aligned to pairs for dual-row SDOT.
 fn chunk_rows(rows: usize) -> usize {
-    let target_chunks = (rayon::current_num_threads() * 16).max(1);
+    let target_chunks = (rayon::current_num_threads() * 2).max(1);
     let chunk = (rows / target_chunks).clamp(32, 2048);
     if !chunk.is_multiple_of(2) && chunk < 2048 {
         chunk + 1
@@ -1002,7 +1048,19 @@ fn chunk_rows(rows: usize) -> usize {
 #[inline(always)]
 unsafe fn half_raw(ptr: *const u8) -> f32 {
     let bits = unsafe { (ptr as *const u16).read_unaligned() };
-    f16::from_bits(u16::from_le(bits)).to_f32()
+    let out: f32;
+    unsafe {
+        std::arch::asm!(
+            ".arch armv8.2-a+fp16",
+            "fmov {tmp:h}, {bits:w}",
+            "fcvt {out:s}, {tmp:h}",
+            bits = in(reg) bits,
+            tmp = out(vreg) _,
+            out = out(vreg) out,
+            options(pure, nomem, nostack)
+        );
+    }
+    out
 }
 
 pub fn decode(dtype: DType, bytes: &[u8], out: &mut [f32]) -> Result<()> {
@@ -1398,10 +1456,7 @@ const fn digit_tables() -> [[u8; 32]; 4] {
     tables
 }
 
-/// Expand chunk `c` of one 42-byte STQ block into the four 16-lane ternary
-/// digit vectors, one per output lane group `p`. Digits are `{-1, 0, 1}`.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
+
 unsafe fn stq_digit_lanes(
     bytes: *const u8,
     c: usize,
@@ -1504,6 +1559,8 @@ unsafe fn stq_row_dot_sdot(row_bytes: &[u8], activations: &[i8], scales: &[f32])
         vaddvq_f32(row_acc)
     }
 }
+
+
 
 /// Fused NEON kernel: gathers codebook bytes with a 32-entry table lookup,
 /// extracts each 2-bit lane, and FMA-accumulates against the activations.
@@ -1817,18 +1874,18 @@ unsafe fn q2c_unpack_64_with_masks(
     }
 }
 
-/// ARMv8.2 SDOT row dot for Q2_0C. Each 512-weight block has two 256-weight
-/// activation groups.
+/// ARMv8.2 SDOT row dot for Q2_0C with de-interleaved activations.
+/// Each 512-weight block has two 256-weight activation groups.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon,dotprod")]
-unsafe fn q2c_row_dot_sdot(row_bytes: &[u8], activations: &[i8], scales: &[f32]) -> f32 {
+unsafe fn q2c_row_dot_sdot(row_bytes: &[u8], activations_q2c: &[i8], scales: &[f32]) -> f32 {
     use std::arch::aarch64::*;
     unsafe {
         let mask3 = vdupq_n_u8(3);
         let three = vdupq_n_s8(3);
         let mut row_acc = vdupq_n_f32(0.);
         let mut b_ptr = row_bytes.as_ptr();
-        let mut x_ptr = activations.as_ptr();
+        let mut x_ptr = activations_q2c.as_ptr();
         let num_blocks = row_bytes.len() / 130;
 
         for block_idx in 0..num_blocks {
@@ -1841,103 +1898,56 @@ unsafe fn q2c_row_dot_sdot(row_bytes: &[u8], activations: &[i8], scales: &[f32])
             let mut acc1 = vdupq_n_s32(0);
             let mut acc2 = vdupq_n_s32(0);
             let mut acc3 = vdupq_n_s32(0);
+
+            for c in 0..4usize {
+                let raw = vld1q_u8(payload.add(c * 16));
+                let p0 = vandq_u8(raw, mask3);
+                let p1 = vandq_u8(vshrq_n_u8(raw, 2), mask3);
+                let p2 = vandq_u8(vshrq_n_u8(raw, 4), mask3);
+                let p3 = vshrq_n_u8(raw, 6);
+
+                let p0_val = vsubq_s8(vshlq_n_s8(vreinterpretq_s8_u8(p0), 1), three);
+                let p1_val = vsubq_s8(vshlq_n_s8(vreinterpretq_s8_u8(p1), 1), three);
+                let p2_val = vsubq_s8(vshlq_n_s8(vreinterpretq_s8_u8(p2), 1), three);
+                let p3_val = vsubq_s8(vshlq_n_s8(vreinterpretq_s8_u8(p3), 1), three);
+
+                let xp = x_ptr.add(c * 64);
+                acc0 = sdot(acc0, vld1q_s8(xp), p0_val);
+                acc1 = sdot(acc1, vld1q_s8(xp.add(16)), p1_val);
+                acc2 = sdot(acc2, vld1q_s8(xp.add(32)), p2_val);
+                acc3 = sdot(acc3, vld1q_s8(xp.add(48)), p3_val);
+            }
+
+            let grp0_sum = vaddq_s32(vaddq_s32(acc0, acc1), vaddq_s32(acc2, acc3));
+            row_acc = vfmaq_n_f32(row_acc, vcvtq_f32_s32(grp0_sum), scale0);
+
+            // Group 1: second 256 weights (chunks 4..8)
+            let scale1 = d * scales[block_idx * 2 + 1];
             let mut acc4 = vdupq_n_s32(0);
             let mut acc5 = vdupq_n_s32(0);
             let mut acc6 = vdupq_n_s32(0);
             let mut acc7 = vdupq_n_s32(0);
 
-            // Chunk 0
-            let raw0 = vld1q_u8(payload);
-            let [w0, w1, w2, w3] = q2c_unpack_64_with_masks(raw0, mask3, three);
-            acc0 = sdot(acc0, vld1q_s8(x_ptr), w0);
-            acc1 = sdot(acc1, vld1q_s8(x_ptr.add(16)), w1);
-            acc2 = sdot(acc2, vld1q_s8(x_ptr.add(32)), w2);
-            acc3 = sdot(acc3, vld1q_s8(x_ptr.add(48)), w3);
+            for c in 0..4usize {
+                let raw = vld1q_u8(payload.add(64 + c * 16));
+                let p0 = vandq_u8(raw, mask3);
+                let p1 = vandq_u8(vshrq_n_u8(raw, 2), mask3);
+                let p2 = vandq_u8(vshrq_n_u8(raw, 4), mask3);
+                let p3 = vshrq_n_u8(raw, 6);
 
-            // Chunk 1
-            let raw1 = vld1q_u8(payload.add(16));
-            let [w4, w5, w6, w7] = q2c_unpack_64_with_masks(raw1, mask3, three);
-            let xp1 = x_ptr.add(64);
-            acc4 = sdot(acc4, vld1q_s8(xp1), w4);
-            acc5 = sdot(acc5, vld1q_s8(xp1.add(16)), w5);
-            acc6 = sdot(acc6, vld1q_s8(xp1.add(32)), w6);
-            acc7 = sdot(acc7, vld1q_s8(xp1.add(48)), w7);
+                let p0_val = vsubq_s8(vshlq_n_s8(vreinterpretq_s8_u8(p0), 1), three);
+                let p1_val = vsubq_s8(vshlq_n_s8(vreinterpretq_s8_u8(p1), 1), three);
+                let p2_val = vsubq_s8(vshlq_n_s8(vreinterpretq_s8_u8(p2), 1), three);
+                let p3_val = vsubq_s8(vshlq_n_s8(vreinterpretq_s8_u8(p3), 1), three);
 
-            // Chunk 2
-            let raw2 = vld1q_u8(payload.add(32));
-            let [w8, w9, w10, w11] = q2c_unpack_64_with_masks(raw2, mask3, three);
-            let xp2 = x_ptr.add(128);
-            acc0 = sdot(acc0, vld1q_s8(xp2), w8);
-            acc1 = sdot(acc1, vld1q_s8(xp2.add(16)), w9);
-            acc2 = sdot(acc2, vld1q_s8(xp2.add(32)), w10);
-            acc3 = sdot(acc3, vld1q_s8(xp2.add(48)), w11);
+                let xp = x_ptr.add(256 + c * 64);
+                acc4 = sdot(acc4, vld1q_s8(xp), p0_val);
+                acc5 = sdot(acc5, vld1q_s8(xp.add(16)), p1_val);
+                acc6 = sdot(acc6, vld1q_s8(xp.add(32)), p2_val);
+                acc7 = sdot(acc7, vld1q_s8(xp.add(48)), p3_val);
+            }
 
-            // Chunk 3
-            let raw3 = vld1q_u8(payload.add(48));
-            let [w12, w13, w14, w15] = q2c_unpack_64_with_masks(raw3, mask3, three);
-            let xp3 = x_ptr.add(192);
-            acc4 = sdot(acc4, vld1q_s8(xp3), w12);
-            acc5 = sdot(acc5, vld1q_s8(xp3.add(16)), w13);
-            acc6 = sdot(acc6, vld1q_s8(xp3.add(32)), w14);
-            acc7 = sdot(acc7, vld1q_s8(xp3.add(48)), w15);
-
-            let grp0_sum = vaddq_s32(
-                vaddq_s32(vaddq_s32(acc0, acc1), vaddq_s32(acc2, acc3)),
-                vaddq_s32(vaddq_s32(acc4, acc5), vaddq_s32(acc6, acc7)),
-            );
-            row_acc = vfmaq_n_f32(row_acc, vcvtq_f32_s32(grp0_sum), scale0);
-
-            // Group 1: second 256 weights (chunks 4..8)
-            let scale1 = d * scales[block_idx * 2 + 1];
-            let mut acc8 = vdupq_n_s32(0);
-            let mut acc9 = vdupq_n_s32(0);
-            let mut acc10 = vdupq_n_s32(0);
-            let mut acc11 = vdupq_n_s32(0);
-            let mut acc12 = vdupq_n_s32(0);
-            let mut acc13 = vdupq_n_s32(0);
-            let mut acc14 = vdupq_n_s32(0);
-            let mut acc15 = vdupq_n_s32(0);
-
-            // Chunk 4
-            let raw4 = vld1q_u8(payload.add(64));
-            let [w16, w17, w18, w19] = q2c_unpack_64_with_masks(raw4, mask3, three);
-            let xp4 = x_ptr.add(256);
-            acc8 = sdot(acc8, vld1q_s8(xp4), w16);
-            acc9 = sdot(acc9, vld1q_s8(xp4.add(16)), w17);
-            acc10 = sdot(acc10, vld1q_s8(xp4.add(32)), w18);
-            acc11 = sdot(acc11, vld1q_s8(xp4.add(48)), w19);
-
-            // Chunk 5
-            let raw5 = vld1q_u8(payload.add(80));
-            let [w20, w21, w22, w23] = q2c_unpack_64_with_masks(raw5, mask3, three);
-            let xp5 = x_ptr.add(320);
-            acc12 = sdot(acc12, vld1q_s8(xp5), w20);
-            acc13 = sdot(acc13, vld1q_s8(xp5.add(16)), w21);
-            acc14 = sdot(acc14, vld1q_s8(xp5.add(32)), w22);
-            acc15 = sdot(acc15, vld1q_s8(xp5.add(48)), w23);
-
-            // Chunk 6
-            let raw6 = vld1q_u8(payload.add(96));
-            let [w24, w25, w26, w27] = q2c_unpack_64_with_masks(raw6, mask3, three);
-            let xp6 = x_ptr.add(384);
-            acc8 = sdot(acc8, vld1q_s8(xp6), w24);
-            acc9 = sdot(acc9, vld1q_s8(xp6.add(16)), w25);
-            acc10 = sdot(acc10, vld1q_s8(xp6.add(32)), w26);
-            acc11 = sdot(acc11, vld1q_s8(xp6.add(48)), w27);
-
-            // Chunk 7
-            let raw7 = vld1q_u8(payload.add(112));
-            let [w28, w29, w30, w31] = q2c_unpack_64_with_masks(raw7, mask3, three);
-            let xp7 = x_ptr.add(448);
-            acc12 = sdot(acc12, vld1q_s8(xp7), w28);
-            acc13 = sdot(acc13, vld1q_s8(xp7.add(16)), w29);
-            acc14 = sdot(acc14, vld1q_s8(xp7.add(32)), w30);
-            acc15 = sdot(acc15, vld1q_s8(xp7.add(48)), w31);
-
-            let grp1_sum = vaddq_s32(
-                vaddq_s32(vaddq_s32(acc8, acc9), vaddq_s32(acc10, acc11)),
-                vaddq_s32(vaddq_s32(acc12, acc13), vaddq_s32(acc14, acc15)),
-            );
+            let grp1_sum = vaddq_s32(vaddq_s32(acc4, acc5), vaddq_s32(acc6, acc7));
             row_acc = vfmaq_n_f32(row_acc, vcvtq_f32_s32(grp1_sum), scale1);
 
             b_ptr = b_ptr.add(130);
@@ -1945,6 +1955,165 @@ unsafe fn q2c_row_dot_sdot(row_bytes: &[u8], activations: &[i8], scales: &[f32])
         }
 
         vaddvq_f32(row_acc)
+    }
+}
+
+/// ARMv8.2 dual-row SDOT dot for Q2_0C with de-interleaved activations.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,dotprod")]
+unsafe fn q2c_2rows_dot_sdot(
+    row0_bytes: &[u8],
+    row1_bytes: &[u8],
+    activations_q2c: &[i8],
+    scales: &[f32],
+) -> (f32, f32) {
+    use std::arch::aarch64::*;
+    unsafe {
+        let mask3 = vdupq_n_u8(3);
+        let three = vdupq_n_s8(3);
+        let mut row0_acc = vdupq_n_f32(0.);
+        let mut row1_acc = vdupq_n_f32(0.);
+        let mut b0_ptr = row0_bytes.as_ptr();
+        let mut b1_ptr = row1_bytes.as_ptr();
+        let mut x_ptr = activations_q2c.as_ptr();
+        let num_blocks = row0_bytes.len() / 130;
+
+        for block_idx in 0..num_blocks {
+            let d0 = half_raw(b0_ptr);
+            let d1 = half_raw(b1_ptr);
+            let payload0 = b0_ptr.add(2);
+            let payload1 = b1_ptr.add(2);
+
+            // Group 0: first 256 weights (chunks 0..4)
+            let sc0 = scales[block_idx * 2];
+            let scale0_0 = d0 * sc0;
+            let scale1_0 = d1 * sc0;
+            let mut acc0_0 = vdupq_n_s32(0);
+            let mut acc1_0 = vdupq_n_s32(0);
+            let mut acc2_0 = vdupq_n_s32(0);
+            let mut acc3_0 = vdupq_n_s32(0);
+
+            let mut acc0_1 = vdupq_n_s32(0);
+            let mut acc1_1 = vdupq_n_s32(0);
+            let mut acc2_1 = vdupq_n_s32(0);
+            let mut acc3_1 = vdupq_n_s32(0);
+
+            for c in 0..4usize {
+                let raw0 = vld1q_u8(payload0.add(c * 16));
+                let raw1 = vld1q_u8(payload1.add(c * 16));
+
+                let p0_0 = vandq_u8(raw0, mask3);
+                let p1_0 = vandq_u8(vshrq_n_u8(raw0, 2), mask3);
+                let p2_0 = vandq_u8(vshrq_n_u8(raw0, 4), mask3);
+                let p3_0 = vshrq_n_u8(raw0, 6);
+
+                let p0_1 = vandq_u8(raw1, mask3);
+                let p1_1 = vandq_u8(vshrq_n_u8(raw1, 2), mask3);
+                let p2_1 = vandq_u8(vshrq_n_u8(raw1, 4), mask3);
+                let p3_1 = vshrq_n_u8(raw1, 6);
+
+                let p0_val0 = vsubq_s8(vshlq_n_s8(vreinterpretq_s8_u8(p0_0), 1), three);
+                let p1_val0 = vsubq_s8(vshlq_n_s8(vreinterpretq_s8_u8(p1_0), 1), three);
+                let p2_val0 = vsubq_s8(vshlq_n_s8(vreinterpretq_s8_u8(p2_0), 1), three);
+                let p3_val0 = vsubq_s8(vshlq_n_s8(vreinterpretq_s8_u8(p3_0), 1), three);
+
+                let p0_val1 = vsubq_s8(vshlq_n_s8(vreinterpretq_s8_u8(p0_1), 1), three);
+                let p1_val1 = vsubq_s8(vshlq_n_s8(vreinterpretq_s8_u8(p1_1), 1), three);
+                let p2_val1 = vsubq_s8(vshlq_n_s8(vreinterpretq_s8_u8(p2_1), 1), three);
+                let p3_val1 = vsubq_s8(vshlq_n_s8(vreinterpretq_s8_u8(p3_1), 1), three);
+
+                let xp = x_ptr.add(c * 64);
+                let x0 = vld1q_s8(xp);
+                let x1 = vld1q_s8(xp.add(16));
+                let x2 = vld1q_s8(xp.add(32));
+                let x3 = vld1q_s8(xp.add(48));
+
+                acc0_0 = sdot(acc0_0, x0, p0_val0);
+                acc0_1 = sdot(acc0_1, x0, p0_val1);
+
+                acc1_0 = sdot(acc1_0, x1, p1_val0);
+                acc1_1 = sdot(acc1_1, x1, p1_val1);
+
+                acc2_0 = sdot(acc2_0, x2, p2_val0);
+                acc2_1 = sdot(acc2_1, x2, p2_val1);
+
+                acc3_0 = sdot(acc3_0, x3, p3_val0);
+                acc3_1 = sdot(acc3_1, x3, p3_val1);
+            }
+
+            let grp0_sum0 = vaddq_s32(vaddq_s32(acc0_0, acc1_0), vaddq_s32(acc2_0, acc3_0));
+            let grp0_sum1 = vaddq_s32(vaddq_s32(acc0_1, acc1_1), vaddq_s32(acc2_1, acc3_1));
+            row0_acc = vfmaq_n_f32(row0_acc, vcvtq_f32_s32(grp0_sum0), scale0_0);
+            row1_acc = vfmaq_n_f32(row1_acc, vcvtq_f32_s32(grp0_sum1), scale1_0);
+
+            // Group 1: second 256 weights (chunks 4..8)
+            let sc1 = scales[block_idx * 2 + 1];
+            let scale0_1 = d0 * sc1;
+            let scale1_1 = d1 * sc1;
+            let mut acc4_0 = vdupq_n_s32(0);
+            let mut acc5_0 = vdupq_n_s32(0);
+            let mut acc6_0 = vdupq_n_s32(0);
+            let mut acc7_0 = vdupq_n_s32(0);
+
+            let mut acc4_1 = vdupq_n_s32(0);
+            let mut acc5_1 = vdupq_n_s32(0);
+            let mut acc6_1 = vdupq_n_s32(0);
+            let mut acc7_1 = vdupq_n_s32(0);
+
+            for c in 0..4usize {
+                let raw0 = vld1q_u8(payload0.add(64 + c * 16));
+                let raw1 = vld1q_u8(payload1.add(64 + c * 16));
+
+                let p0_0 = vandq_u8(raw0, mask3);
+                let p1_0 = vandq_u8(vshrq_n_u8(raw0, 2), mask3);
+                let p2_0 = vandq_u8(vshrq_n_u8(raw0, 4), mask3);
+                let p3_0 = vshrq_n_u8(raw0, 6);
+
+                let p0_1 = vandq_u8(raw1, mask3);
+                let p1_1 = vandq_u8(vshrq_n_u8(raw1, 2), mask3);
+                let p2_1 = vandq_u8(vshrq_n_u8(raw1, 4), mask3);
+                let p3_1 = vshrq_n_u8(raw1, 6);
+
+                let p0_val0 = vsubq_s8(vshlq_n_s8(vreinterpretq_s8_u8(p0_0), 1), three);
+                let p1_val0 = vsubq_s8(vshlq_n_s8(vreinterpretq_s8_u8(p1_0), 1), three);
+                let p2_val0 = vsubq_s8(vshlq_n_s8(vreinterpretq_s8_u8(p2_0), 1), three);
+                let p3_val0 = vsubq_s8(vshlq_n_s8(vreinterpretq_s8_u8(p3_0), 1), three);
+
+                let p0_val1 = vsubq_s8(vshlq_n_s8(vreinterpretq_s8_u8(p0_1), 1), three);
+                let p1_val1 = vsubq_s8(vshlq_n_s8(vreinterpretq_s8_u8(p1_1), 1), three);
+                let p2_val1 = vsubq_s8(vshlq_n_s8(vreinterpretq_s8_u8(p2_1), 1), three);
+                let p3_val1 = vsubq_s8(vshlq_n_s8(vreinterpretq_s8_u8(p3_1), 1), three);
+
+                let xp = x_ptr.add(256 + c * 64);
+                let x0 = vld1q_s8(xp);
+                let x1 = vld1q_s8(xp.add(16));
+                let x2 = vld1q_s8(xp.add(32));
+                let x3 = vld1q_s8(xp.add(48));
+
+                acc4_0 = sdot(acc4_0, x0, p0_val0);
+                acc4_1 = sdot(acc4_1, x0, p0_val1);
+
+                acc5_0 = sdot(acc5_0, x1, p1_val0);
+                acc5_1 = sdot(acc5_1, x1, p1_val1);
+
+                acc6_0 = sdot(acc6_0, x2, p2_val0);
+                acc6_1 = sdot(acc6_1, x2, p2_val1);
+
+                acc7_0 = sdot(acc7_0, x3, p3_val0);
+                acc7_1 = sdot(acc7_1, x3, p3_val1);
+            }
+
+            let grp1_sum0 = vaddq_s32(vaddq_s32(acc4_0, acc5_0), vaddq_s32(acc6_0, acc7_0));
+            let grp1_sum1 = vaddq_s32(vaddq_s32(acc4_1, acc5_1), vaddq_s32(acc6_1, acc7_1));
+            row0_acc = vfmaq_n_f32(row0_acc, vcvtq_f32_s32(grp1_sum0), scale0_1);
+            row1_acc = vfmaq_n_f32(row1_acc, vcvtq_f32_s32(grp1_sum1), scale1_1);
+
+            b0_ptr = b0_ptr.add(130);
+            b1_ptr = b1_ptr.add(130);
+            x_ptr = x_ptr.add(512);
+        }
+
+        (vaddvq_f32(row0_acc), vaddvq_f32(row1_acc))
     }
 }
 
@@ -2050,14 +2219,14 @@ unsafe fn q2c_decode_block_neon(bytes: &[u8], out: &mut [f32]) {
 /// One packed row of `dtype` against quantized activations.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn row_dot_q8_raw(dtype: DType, row: &[u8], q8_values: &[i8], q8_scales: &[f32]) -> f32 {
+unsafe fn row_dot_q8_raw(dtype: DType, row: &[u8], q8_values: &[i8], q8_scales: &[f32], q8_q2c: &[i8]) -> f32 {
     // SAFETY: callers pass whole rows, so every row is a whole number of
     // 256-weight blocks, and `q8` holds one scale and 256 values per block.
     unsafe {
         match dtype {
             DType::STQ1_0 => stq_row_dot_sdot(row, q8_values, q8_scales),
             DType::Q6_K => q6_row_dot_sdot(row, q8_values, q8_scales),
-            DType::Q2_0C => q2c_row_dot_sdot(row, q8_values, q8_scales),
+            DType::Q2_0C => q2c_row_dot_sdot(row, q8_q2c, q8_scales),
             _ => unreachable!(),
         }
     }
@@ -2066,7 +2235,7 @@ unsafe fn row_dot_q8_raw(dtype: DType, row: &[u8], q8_values: &[i8], q8_scales: 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn row_dot_q8(dtype: DType, row: &[u8], q8: &Q8) -> f32 {
-    unsafe { row_dot_q8_raw(dtype, row, q8.values(), q8.scales()) }
+    unsafe { row_dot_q8_raw(dtype, row, q8.values(), q8.scales(), q8.values_q2c()) }
 }
 
 /// ARMv8.2 SDOT row dot for Q6_K. Integer dot products replace the per-lane
@@ -2901,7 +3070,7 @@ mod tests {
                 })
                 .sum();
             // SAFETY: the row is one whole 130-byte block and `q8` covers it.
-            let got = unsafe { q2c_row_dot_sdot(&q2c, q8.values(), q8.scales()) };
+            let got = unsafe { q2c_row_dot_sdot(&q2c, q8.values_q2c(), q8.scales()) };
             assert!(
                 (got as f64 - expected).abs() <= magnitude * 1e-5,
                 "seed {seed}: sdot {got} vs reference {expected}"
